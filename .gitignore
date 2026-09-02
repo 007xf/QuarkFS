@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+DerivedData/
+*.xcuserstate
+QuarkFS.app/
+
+# Previous menu-bar bitmap experiments are kept locally for reference only;
+# the shipped menu icon is the native SF Symbol configured in QuarkFSApp.swift.
+Resources/MenuBarIcon*.png

@@ -1,0 +1,40 @@
+name: QuarkFS CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check build scripts
+        run: |
+          zsh -n "Scripts/01 构建引擎.command"
+          zsh -n "Scripts/02 打包应用.command"
+          zsh -n "Scripts/03 生成发布包.command"
+
+      - name: Run core smoke test
+        run: swift run --disable-sandbox --build-system native --scratch-path .build/ci-smoke QuarkFSSmokeTests
+
+      - name: Build Apple Silicon app
+        run: swift build --disable-sandbox --build-system native --scratch-path .build/ci-arm64 -c release --triple arm64-apple-macosx14.0
+
+      - name: Build Intel app
+        run: swift build --disable-sandbox --build-system native --scratch-path .build/ci-x86_64 -c release --triple x86_64-apple-macosx14.0
+
+      - name: Verify both app architectures
+        run: |
+          ARM_BIN=".build/ci-arm64/arm64-apple-macosx/release/QuarkFS"
+          INTEL_BIN=".build/ci-x86_64/x86_64-apple-macosx/release/QuarkFS"
+          test -x "$ARM_BIN"
+          test -x "$INTEL_BIN"
+          test "$(lipo -archs "$ARM_BIN")" = "arm64"
+          test "$(lipo -archs "$INTEL_BIN")" = "x86_64"
