@@ -240,16 +240,16 @@ final class AppModel: ObservableObject {
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
                 let line = String(decoding: data, as: UTF8.self)
-                Task { @MainActor in self?.appendEngineOutput(line) }
+                Task { @MainActor [weak self] in self?.appendEngineOutput(line) }
             }
             stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
                 let line = String(decoding: data, as: UTF8.self)
-                Task { @MainActor in self?.appendEngineOutput(line) }
+                Task { @MainActor [weak self] in self?.appendEngineOutput(line) }
             }
             process.terminationHandler = { [weak self] terminated in
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     self?.handleTermination(status: terminated.terminationStatus)
                 }
             }
@@ -372,7 +372,7 @@ final class AppModel: ObservableObject {
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             process.terminationHandler = { [weak self] _ in
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     guard let self, self.infuseBridgeProcess === process else { return }
                     self.infuseBridgeProcess = nil
                     self.infuseBridgeRunning = false
