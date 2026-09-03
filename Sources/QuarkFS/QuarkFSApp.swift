@@ -60,7 +60,7 @@ private struct QuarkFSCommands: Commands {
                 }
             }
             .appShortcut(model.shortcut(for: .toggleMount))
-            .disabled(isConnected ? model.status == .unmounting : !model.preflight.ready)
+            .disabled(isConnected ? model.status == .unmounting : (!model.preflight.ready || model.mountOperationInProgress))
 
             Button("在 Finder 中打开") {
                 model.openMountFolder()
@@ -78,12 +78,12 @@ private struct QuarkFSCommands: Commands {
                 model.clearCache()
             }
             .appShortcut(model.shortcut(for: .clearCache))
-            .disabled(model.status == .mounted || model.status == .mounting)
+            .disabled(!model.canClearCache)
         }
     }
 
     private var isConnected: Bool {
-        model.status == .mounted || model.status == .mounting
+        model.shouldOfferUnmount
     }
 }
 
@@ -307,17 +307,18 @@ private struct MenuBarContent: View {
         }
         .appShortcut(model.shortcut(for: .showWindow))
 
-        if model.status == .mounted || model.status == .mounting {
+        if model.shouldOfferUnmount {
             Button("卸载 Quark") {
                 model.unmount()
             }
             .appShortcut(model.shortcut(for: .toggleMount))
+            .disabled(model.status == .unmounting)
         } else {
             Button("挂载 Quark") {
                 model.mount()
             }
             .appShortcut(model.shortcut(for: .toggleMount))
-            .disabled(!model.preflight.ready)
+            .disabled(!model.preflight.ready || model.mountOperationInProgress)
         }
 
         Button("在 Finder 中打开") {
@@ -336,7 +337,7 @@ private struct MenuBarContent: View {
             model.clearCache()
         }
         .appShortcut(model.shortcut(for: .clearCache))
-        .disabled(model.status == .mounted || model.status == .mounting)
+        .disabled(!model.canClearCache)
 
         Divider()
 

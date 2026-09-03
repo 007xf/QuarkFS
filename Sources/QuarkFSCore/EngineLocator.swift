@@ -95,4 +95,29 @@ public enum EngineLocator {
     public static var isMacFUSEInstalled: Bool {
         FileManager.default.fileExists(atPath: "/Library/Filesystems/macfuse.fs")
     }
+
+    public static var isMacFUSEReady: Bool {
+        guard isMacFUSEInstalled else { return false }
+
+        let mountOutput = (try? ProcessRunner.run(
+            executable: URL(fileURLWithPath: "/sbin/mount"),
+            arguments: []
+        )).map { $0.standardOutput + $0.standardError } ?? ""
+        if macFUSEIsLoaded(kmutilOutput: "", mountOutput: mountOutput) { return true }
+
+        let loadedExtensions = (try? ProcessRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/kmutil"),
+            arguments: ["showloaded", "--list-only"]
+        )).map { $0.standardOutput + $0.standardError } ?? ""
+        return macFUSEIsLoaded(kmutilOutput: loadedExtensions, mountOutput: mountOutput)
+    }
+
+    public static func macFUSEIsLoaded(kmutilOutput: String, mountOutput: String) -> Bool {
+        let extensionText = kmutilOutput.lowercased()
+        let mounts = mountOutput.lowercased()
+        return extensionText.contains("io.macfuse.filesystems.macfuse")
+            || extensionText.contains("io.github.osxfuse.filesystems.osxfuse")
+            || mounts.contains("(macfuse,")
+            || mounts.contains("(macfuse)")
+    }
 }

@@ -22,7 +22,7 @@ public enum MountPlanBuilder {
             "--config", paths.runtimeConfig.path,
             "--read-only",
             "--volname", "Quark",
-            "--cache-dir", paths.cacheDirectory.path,
+            "--cache-dir", paths.mountCacheDirectory.path,
             "--vfs-cache-mode", settings.profile.vfsCacheMode,
             "--buffer-size", settings.profile.bufferSize,
             "--dir-cache-time", "10m",
@@ -43,5 +43,32 @@ public enum MountPlanBuilder {
         }
 
         return MountPlan(command: command, arguments: arguments)
+    }
+}
+
+public enum InfusePlanBuilder {
+    public static func make(settings: AppSettings, paths: AppPaths) -> [String] {
+        var arguments = [
+            "--config", paths.runtimeConfig.path,
+            "serve", "webdav", "quark:",
+            "--addr", "127.0.0.1:8686",
+            "--read-only",
+            "--cache-dir", paths.infuseCacheDirectory.path,
+            "--vfs-cache-mode", settings.profile.vfsCacheMode,
+            "--buffer-size", settings.profile.bufferSize,
+            "--log-file", paths.supportDirectory.appendingPathComponent("Infuse-WebDAV.log").path,
+            "--log-level", "INFO"
+        ]
+
+        if let limit = settings.profile.diskCacheLimit {
+            arguments.append(contentsOf: [
+                "--vfs-cache-max-size", limit,
+                "--vfs-cache-poll-interval", "15s",
+                "--vfs-cache-max-age",
+                settings.autoCleanup ? "\(max(15, settings.cleanupDelaySeconds))s" : "24h"
+            ])
+        }
+
+        return arguments
     }
 }

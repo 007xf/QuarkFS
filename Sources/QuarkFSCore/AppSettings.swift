@@ -73,6 +73,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
 public struct AppPaths: Sendable {
     public let supportDirectory: URL
     public let cacheDirectory: URL
+    public let mountCacheDirectory: URL
+    public let infuseCacheDirectory: URL
     public let runtimeDirectory: URL
     public let runtimeConfig: URL
     public let logFile: URL
@@ -85,6 +87,8 @@ public struct AppPaths: Sendable {
 
         supportDirectory = base
         cacheDirectory = base.appendingPathComponent("Cache", isDirectory: true)
+        mountCacheDirectory = cacheDirectory.appendingPathComponent("Mount", isDirectory: true)
+        infuseCacheDirectory = cacheDirectory.appendingPathComponent("Infuse", isDirectory: true)
         runtimeDirectory = base.appendingPathComponent("Runtime", isDirectory: true)
         runtimeConfig = runtimeDirectory.appendingPathComponent("rclone.conf")
         logFile = base.appendingPathComponent("QuarkFS.log")
@@ -94,6 +98,8 @@ public struct AppPaths: Sendable {
         let manager = FileManager.default
         try manager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
         try manager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        try manager.createDirectory(at: mountCacheDirectory, withIntermediateDirectories: true)
+        try manager.createDirectory(at: infuseCacheDirectory, withIntermediateDirectories: true)
         try manager.createDirectory(at: runtimeDirectory, withIntermediateDirectories: true)
     }
 }

@@ -63,13 +63,19 @@ QuarkFS 运行并完成登录后，会自动启动只读 WebDAV。Infuse 的字�
 
 如果 Infuse 看不到目录，先回到 QuarkFS 确认“Infuse 本机连接”显示“已就绪”，再点“重新启动”；不要把 `~/Quark` 当作 Infuse 的网络地址。
 
+如果看到“文件系统引擎已退出（代码 1）”，先点“重新检查”。应用会识别旧版或手动启动留下的同一挂载点并接管状态，避免再次重复挂载；需要卸载时先停止播放器，再点“卸载 Quark”。
+
 ## 缓存与安全边界
 
-QuarkFS 只读挂载和只读 WebDAV 都会把写入操作拒绝给上游网盘。零残留模式关闭视频磁盘缓存；平衡和高性能模式只使用应用自己的目录：
+QuarkFS 只读挂载和只读 WebDAV 都会把写入操作拒绝给上游网盘。两条读取路径使用相互独立的缓存子目录，并统一遵循当前的“零残留 / 平衡 / 高性能”设置；修改缓存策略时，本机 WebDAV 会自动安全重启并应用新参数：
 
 ```text
-~/Library/Application Support/com.holmes.QuarkFS/Cache
-~/Library/Application Support/com.holmes.QuarkFS/Runtime/rclone.conf
+~/Library/Application Support/com.holmes.QuarkFS
+├── Cache
+│   ├── Mount
+│   └── Infuse
+└── Runtime
+    └── rclone.conf
 ```
 
 运行期配置在进程退出时删除，缓存清理器会校验目录必须位于上述应用支持目录内，不会递归删除用户的其他文件。Cookie 由 macOS 钥匙串保护；日志可能包含网络错误和文件路径，请在提交 Issue 前自行检查并脱敏。

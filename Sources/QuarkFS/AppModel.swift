@@ -39,11 +39,12 @@ struct PreflightState {
         problem: "正在检查"
     )
     var macFUSEInstalled = false
+    var macFUSEReady = false
     var hasCredential = false
     var mountDirectoryReady = false
 
     var ready: Bool {
-        engine.isQuarkCapable && engine.mountCommand == "cmount" && macFUSEInstalled && hasCredential && mountDirectoryReady
+        engine.isQuarkCapable && engine.mountCommand == "cmount" && macFUSEReady && hasCredential && mountDirectoryReady
     }
 }
 
@@ -54,6 +55,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var preflight = PreflightState()
     @Published private(set) var cacheBytes: Int64 = 0
     @Published private(set) var infuseBridgeRunning = false
+    @Published private(set) var hasActiveMount = false
     @Published private(set) var shortcuts: ShortcutPreferences
     @Published private(set) var logs: [String] = []
     @Published var cookieInput = ""
@@ -67,8 +69,26 @@ final class AppModel: ObservableObject {
     private var infuseBridgeProcess: Process?
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
+    private var activeMountPath: String?
+    private var infuseBridgeSettings: AppSettings?
     private let settingsKey = "QuarkFS.settings.v1"
     private let shortcutsKey = "QuarkFS.shortcuts.v1"
+
+    var mountOperationInProgress: Bool {
+        status == .mounting || status == .unmounting
+    }
+
+    var shouldOfferUnmount: Bool {
+        hasActiveMount || mountOperationInProgress
+    }
+
+    var canEditMountPath: Bool {
+        !hasActiveMount && !mountOperationInProgress
+    }
+
+    var canClearCache: Bool {
+        !hasActiveMount && !mountOperationInProgress
+    }
 
     init(
         credentialStore: any CredentialStoring = KeychainCredentialStore(),
@@ -144,6 +164,11 @@ final class AppModel: ObservableObject {
     }
 
     func persistSettings() {
+        let shouldRestartBridge = infuseBridgeRunning && infuseBridgeSettings.map {
+            $0.profile != settings.profile
+                || $0.autoCleanup != settings.autoCleanup
+                || $0.cleanupDelaySeconds != settings.cleanupDelaySeconds
+        } == true
         if let data = try? JSONEncoder().encode(settings) {
             defaults.set(data, forKey: settingsKey)
         }
@@ -153,18 +178,23 @@ final class AppModel: ObservableObject {
             status = .failed(error.localizedDescription)
         }
         refreshPreflight()
+        if shouldRestartBridge {
+            restartInfuseBridge()
+        }
     }
 
     func refreshPreflight() {
         let engineURL = EngineLocator.locate()
         preflight.engine = EngineLocator.inspect(engineURL)
         preflight.macFUSEInstalled = EngineLocator.isMacFUSEInstalled
+        preflight.macFUSEReady = EngineLocator.isMacFUSEReady
         preflight.hasCredential = (try? credentialStore.contains()) == true
         var isDirectory: ObjCBool = false
         preflight.mountDirectoryReady = FileManager.default.fileExists(
             atPath: settings.mountPath,
             isDirectory: &isDirectory
         ) && isDirectory.boolValue
+        refreshMountStatus()
     }
 
     func saveCookie() {
@@ -179,7 +209,7 @@ final class AppModel: ObservableObject {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
             appendLog("登录信息已保存到 macOS 钥匙串")
             refreshPreflight()
-            startInfuseBridge()
+            restartInfuseBridge()
         } catch {
             status = .failed(error.localizedDescription)
         }
@@ -192,14 +222,14 @@ final class AppModel: ObservableObject {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
             appendLog("夸克扫码登录成功，凭据已写入钥匙串")
             refreshPreflight()
-            startInfuseBridge()
+            restartInfuseBridge()
         } catch {
             status = .failed(error.localizedDescription)
         }
     }
 
     func forgetCredential() {
-        guard status != .mounted else {
+        guard !hasActiveMount, !mountOperationInProgress else {
             status = .failed("请先卸载 Quark")
             return
         }
@@ -215,8 +245,14 @@ final class AppModel: ObservableObject {
     }
 
     func mount() {
-        guard status != .mounting, status != .mounted else { return }
+        guard !mountOperationInProgress, !hasActiveMount else { return }
         refreshPreflight()
+        if hasActiveMount { return }
+        let presence = mountPresence(at: settings.mountPath)
+        guard presence == .none else {
+            refreshMountStatus()
+            return
+        }
         guard preflight.ready,
               let enginePath = preflight.engine.path,
               let command = preflight.engine.mountCommand else {
@@ -225,9 +261,11 @@ final class AppModel: ObservableObject {
         }
 
         do {
+            let mountSettings = settings
+            let mountPath = mountSettings.mountPath
             let engine = URL(fileURLWithPath: enginePath)
             try prepareRuntimeConfig(engine: engine)
-            let plan = MountPlanBuilder.make(settings: settings, paths: paths, command: command)
+            let plan = MountPlanBuilder.make(settings: mountSettings, paths: paths, command: command)
             let process = Process()
             let stdout = Pipe()
             let stderr = Pipe()
@@ -250,25 +288,20 @@ final class AppModel: ObservableObject {
             }
             process.terminationHandler = { [weak self] terminated in
                 Task { @MainActor [weak self] in
-                    self?.handleTermination(status: terminated.terminationStatus)
+                    self?.handleTermination(process: terminated, status: terminated.terminationStatus)
                 }
             }
 
             try process.run()
             engineProcess = process
+            activeMountPath = mountPath
             outputPipe = stdout
             errorPipe = stderr
             status = .mounting
-            appendLog("正在挂载 \(settings.mountPath)")
+            appendLog("正在挂载 \(mountPath)")
 
             Task {
-                try? await Task.sleep(for: .seconds(1.2))
-                guard self.engineProcess?.isRunning == true else { return }
-                self.status = .mounted
-                self.appendLog("Quark 已作为本地磁盘挂载")
-                if self.settings.openFinderAfterMount {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: self.settings.mountPath))
-                }
+                await self.confirmMount(process: process, path: mountPath, openFinder: mountSettings.openFinderAfterMount)
             }
         } catch {
             status = .failed(error.localizedDescription)
@@ -277,38 +310,85 @@ final class AppModel: ObservableObject {
     }
 
     func unmount() {
-        guard let process = engineProcess, process.isRunning else {
+        guard status != .unmounting else { return }
+        let processID = engineProcess?.processIdentifier ?? 0
+        let mountPath = activeMountPath ?? settings.mountPath
+        let presence = mountPresence(at: mountPath)
+        guard presence != .conflict else {
+            hasActiveMount = false
+            status = .failed("挂载位置被其他磁盘占用，QuarkFS 不会卸载它")
+            appendLog("拒绝卸载：挂载位置不是 Quark macFUSE 磁盘")
+            return
+        }
+        guard processID != 0 || presence == .quark else {
+            activeMountPath = nil
+            hasActiveMount = false
             status = .notMounted
             return
         }
         status = .unmounting
         appendLog("正在卸载 Quark")
 
-        Task.detached { [mountPath = settings.mountPath] in
-            _ = try? ProcessRunner.run(
-                executable: URL(fileURLWithPath: "/sbin/umount"),
-                arguments: [mountPath]
-            )
+        if presence == .none {
+            if let process = engineProcess,
+               process.processIdentifier == processID,
+               process.isRunning {
+                process.terminate()
+            }
+            return
+        }
+
+        Task { @MainActor [weak self, mountPath, processID] in
+            let result = await Task.detached {
+                try? ProcessRunner.run(
+                    executable: URL(fileURLWithPath: "/sbin/umount"),
+                    arguments: [mountPath]
+                )
+            }.value
+            guard let self else { return }
+            guard let result else {
+                self.status = .failed("无法运行系统卸载工具")
+                self.appendLog("卸载失败：无法运行 /sbin/umount")
+                return
+            }
+            guard result.status == 0 else {
+                let detail = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.hasActiveMount = true
+                self.status = .failed(detail.isEmpty ? "卸载失败，磁盘可能正在使用" : "卸载失败：\(detail)")
+                self.appendLog(detail.isEmpty ? "卸载失败：磁盘可能正在使用" : "卸载失败：\(detail)")
+                return
+            }
             try? await Task.sleep(for: .milliseconds(400))
-            if process.isRunning { process.terminate() }
+            if let process = self.engineProcess,
+               process.processIdentifier == processID,
+               process.isRunning {
+                process.terminate()
+            }
+            self.activeMountPath = nil
+            self.hasActiveMount = false
+            self.refreshMountStatus()
         }
     }
 
     func clearCache() {
-        guard status != .mounted, status != .mounting else {
+        guard canClearCache else {
             status = .failed("请先卸载，再清理磁盘缓存")
             return
         }
+        let restartBridge = infuseBridgeRunning
+        if restartBridge { stopInfuseBridge() }
         do {
             try SafeCacheManager(
                 cacheRoot: paths.cacheDirectory,
                 allowedParent: paths.supportDirectory
             ).clear()
+            try paths.prepare()
             cacheBytes = 0
             appendLog("QuarkFS 磁盘缓存已清理")
         } catch {
             status = .failed(error.localizedDescription)
         }
+        if restartBridge { startInfuseBridge() }
     }
 
     func refreshCacheUsage() {
@@ -323,7 +403,7 @@ final class AppModel: ObservableObject {
     }
 
     func openMountFolder() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: settings.mountPath))
+        NSWorkspace.shared.open(URL(fileURLWithPath: activeMountPath ?? settings.mountPath))
     }
 
     func openMacFUSEWebsite() {
@@ -356,18 +436,8 @@ final class AppModel: ObservableObject {
             }
             let process = Process()
             process.executableURL = engine
-            process.arguments = [
-                "--config", paths.runtimeConfig.path,
-                "serve", "webdav", "quark:",
-                "--addr", "127.0.0.1:8686",
-                "--read-only",
-                "--cache-dir", paths.cacheDirectory.path,
-                "--vfs-cache-mode", "full",
-                "--vfs-cache-max-size", "5G",
-                "--vfs-cache-max-age", "24h",
-                "--log-file", paths.supportDirectory.appendingPathComponent("Infuse-WebDAV.log").path,
-                "--log-level", "INFO"
-            ]
+            let bridgeSettings = settings
+            process.arguments = InfusePlanBuilder.make(settings: bridgeSettings, paths: paths)
 
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
@@ -382,6 +452,7 @@ final class AppModel: ObservableObject {
 
             try process.run()
             infuseBridgeProcess = process
+            infuseBridgeSettings = bridgeSettings
             Task {
                 try? await Task.sleep(for: .milliseconds(350))
                 guard self.infuseBridgeProcess === process else { return }
@@ -405,7 +476,11 @@ final class AppModel: ObservableObject {
         }
         infuseBridgeProcess = nil
         infuseBridgeRunning = false
-        if process.isRunning { process.terminate() }
+        infuseBridgeSettings = nil
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
     }
 
     private func prepareMountDirectory() throws {
@@ -447,41 +522,149 @@ final class AppModel: ObservableObject {
 
     func shutdownNow() {
         stopInfuseBridge()
-        if let process = engineProcess, process.isRunning {
-            _ = try? ProcessRunner.run(
+        let mountPath = activeMountPath ?? settings.mountPath
+        let presence = mountPresence(at: mountPath)
+        var unmounted = presence != .quark
+
+        if presence == .quark,
+           let result = try? ProcessRunner.run(
                 executable: URL(fileURLWithPath: "/sbin/umount"),
-                arguments: [settings.mountPath]
-            )
-            if process.isRunning { process.terminate() }
+                arguments: [mountPath]
+           ) {
+            unmounted = result.status == 0
+            if !unmounted {
+                appendLog("退出时卸载失败，已保留文件系统引擎")
+            }
         }
-        try? FileManager.default.removeItem(at: paths.runtimeConfig)
+
+        if let process = engineProcess, process.isRunning, unmounted {
+            process.terminate()
+        }
+        if unmounted {
+            try? FileManager.default.removeItem(at: paths.runtimeConfig)
+        }
     }
 
-    private func handleTermination(status terminationStatus: Int32) {
+    private func confirmMount(process: Process, path: String, openFinder: Bool) async {
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(250))
+            guard engineProcess === process, process.isRunning, status == .mounting else { return }
+            switch mountPresence(at: path) {
+            case .quark:
+                hasActiveMount = true
+                activeMountPath = path
+                status = .mounted
+                appendLog("Quark 已作为本地磁盘挂载")
+                if openFinder {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+                return
+            case .conflict:
+                hasActiveMount = false
+                status = .failed("挂载位置被其他磁盘占用，请更换目录")
+                appendLog("挂载失败：目标位置被非 Quark 磁盘占用")
+                if process.isRunning { process.terminate() }
+                return
+            case .none:
+                continue
+            }
+        }
+
+        guard engineProcess === process, process.isRunning, status == .mounting else { return }
+        status = .failed("挂载未在 5 秒内完成，请查看运行记录")
+        appendLog("挂载超时，正在停止未完成的文件系统引擎")
+        process.terminate()
+    }
+
+    private func handleTermination(process: Process, status terminationStatus: Int32) {
+        guard engineProcess === process else { return }
         let wasUnmounting = self.status == .unmounting
+        let mountPath = activeMountPath ?? settings.mountPath
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         errorPipe?.fileHandleForReading.readabilityHandler = nil
         outputPipe = nil
         errorPipe = nil
         engineProcess = nil
-        try? FileManager.default.removeItem(at: paths.runtimeConfig)
+        if infuseBridgeProcess?.isRunning != true {
+            try? FileManager.default.removeItem(at: paths.runtimeConfig)
+        }
 
         if settings.profile == .zeroResidual || settings.autoCleanup {
             try? SafeCacheManager(
-                cacheRoot: paths.cacheDirectory,
+                cacheRoot: paths.mountCacheDirectory,
                 allowedParent: paths.supportDirectory
             ).clear()
+            try? paths.prepare()
         }
         refreshCacheUsage()
 
-        if wasUnmounting {
+        if isMountActive(at: mountPath) {
+            hasActiveMount = true
+            activeMountPath = mountPath
+            self.status = .mounted
+            appendLog("检测到挂载点仍在使用，已保留“已挂载”状态")
+        } else if wasUnmounting {
+            hasActiveMount = false
+            activeMountPath = nil
             self.status = .notMounted
         } else if terminationStatus == 0 {
+            hasActiveMount = false
+            activeMountPath = nil
             self.status = .notMounted
+        } else if case .failed = self.status {
+            hasActiveMount = false
+            activeMountPath = nil
         } else {
+            hasActiveMount = false
+            activeMountPath = nil
             self.status = .failed("文件系统引擎已退出（代码 \(terminationStatus)）")
         }
         appendLog("文件系统引擎已停止")
+    }
+
+    private func refreshMountStatus() {
+        let mountPath = activeMountPath ?? settings.mountPath
+        switch mountPresence(at: mountPath) {
+        case .quark:
+            let newlyAdopted = !hasActiveMount
+            hasActiveMount = true
+            activeMountPath = mountPath
+            if status != .mounting && status != .unmounting {
+                status = .mounted
+            }
+            if newlyAdopted {
+                appendLog("检测到已有 Quark 挂载点，已接管状态")
+            }
+        case .conflict:
+            hasActiveMount = false
+            activeMountPath = nil
+            if !mountOperationInProgress {
+                status = .failed("挂载位置被其他磁盘占用，请更换目录")
+            }
+        case .none:
+            hasActiveMount = false
+            if status == .mounted || status == .unmounting {
+                activeMountPath = nil
+                status = .notMounted
+            }
+        }
+    }
+
+    private func isMountActive(at path: String) -> Bool {
+        mountPresence(at: path) == .quark
+    }
+
+    private func mountPresence(at path: String) -> MountPresence {
+        guard let result = try? ProcessRunner.run(
+            executable: URL(fileURLWithPath: "/sbin/mount"),
+            arguments: []
+        ), result.status == 0 else {
+            return .none
+        }
+        return MountDetector.presence(
+            output: result.standardOutput + result.standardError,
+            path: path
+        )
     }
 
     private func appendEngineOutput(_ text: String) {

@@ -60,6 +60,7 @@ struct ContentView: View {
                             .font(.headline)
                         TextField("挂载目录", text: $model.settings.mountPath)
                             .textFieldStyle(.roundedBorder)
+                            .disabled(!model.canEditMountPath)
                     }
                     Button("在 Finder 中打开") { model.openMountFolder() }
                         .disabled(!model.preflight.mountDirectoryReady)
@@ -76,14 +77,15 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if model.status == .mounted || model.status == .mounting {
+                    if model.shouldOfferUnmount {
                         Button("卸载", role: .destructive) { model.unmount() }
                             .controlSize(.large)
+                            .disabled(model.status == .unmounting)
                     } else {
                         Button("挂载 Quark") { model.mount() }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.large)
-                            .disabled(!model.preflight.ready)
+                            .disabled(!model.preflight.ready || model.mountOperationInProgress)
                     }
                 }
 
@@ -121,10 +123,10 @@ struct ContentView: View {
                 Divider()
                 checkRow(
                     title: "macFUSE 文件系统",
-                    detail: model.preflight.macFUSEInstalled ? "已安装" : "需要安装并在系统设置中允许",
-                    passed: model.preflight.macFUSEInstalled,
-                    actionTitle: model.preflight.macFUSEInstalled ? nil : "获取 macFUSE",
-                    action: model.openMacFUSEWebsite
+                    detail: macFUSEDetail,
+                    passed: model.preflight.macFUSEReady,
+                    actionTitle: model.preflight.macFUSEReady ? nil : (model.preflight.macFUSEInstalled ? "重新检查" : "获取 macFUSE"),
+                    action: model.preflight.macFUSEInstalled ? model.refreshPreflight : model.openMacFUSEWebsite
                 )
                 Divider()
                 checkRow(
@@ -162,10 +164,11 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .disabled(!model.canClearCache)
 
                 HStack {
                     Toggle("关闭影片后自动清理", isOn: $model.settings.autoCleanup)
-                        .disabled(model.settings.profile == .zeroResidual)
+                        .disabled(model.settings.profile == .zeroResidual || !model.canClearCache)
                     Spacer()
                     Stepper(
                         "等待 \(model.settings.cleanupDelaySeconds) 秒",
@@ -173,7 +176,7 @@ struct ContentView: View {
                         in: 15...600,
                         step: 15
                     )
-                    .disabled(!model.settings.autoCleanup || model.settings.profile == .zeroResidual)
+                    .disabled(!model.settings.autoCleanup || model.settings.profile == .zeroResidual || !model.canClearCache)
                 }
 
                 HStack {
@@ -186,7 +189,7 @@ struct ContentView: View {
                     Spacer()
                     Button("刷新") { model.refreshCacheUsage() }
                     Button("清理全部缓存", role: .destructive) { model.clearCache() }
-                        .disabled(model.status == .mounted || model.status == .mounting)
+                        .disabled(!model.canClearCache)
                 }
 
                 if model.settings.profile != .zeroResidual {
@@ -267,5 +270,11 @@ struct ContentView: View {
         case .mounting, .unmounting: .blue
         case .notMounted: .secondary
         }
+    }
+
+    private var macFUSEDetail: String {
+        if model.preflight.macFUSEReady { return "已安装，系统扩展已加载" }
+        if model.preflight.macFUSEInstalled { return "已安装，但系统扩展尚未加载；请在隐私与安全性中允许后重启" }
+        return "需要安装并在系统设置中允许"
     }
 }
