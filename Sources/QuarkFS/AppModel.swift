@@ -71,6 +71,7 @@ final class AppModel: ObservableObject {
     private var errorPipe: Pipe?
     private var activeMountPath: String?
     private var infuseBridgeSettings: AppSettings?
+    private var cachedObscuredCookie: String?
     private let settingsKey = "QuarkFS.settings.v1"
     private let shortcutsKey = "QuarkFS.shortcuts.v1"
 
@@ -205,6 +206,7 @@ final class AppModel: ObservableObject {
         }
         do {
             try credentialStore.save(cookie)
+            cachedObscuredCookie = nil
             cookieInput = ""
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
             appendLog("登录信息已保存到 macOS 钥匙串")
@@ -218,6 +220,7 @@ final class AppModel: ObservableObject {
     func saveCookieFromQR(_ cookie: String) {
         do {
             try credentialStore.save(cookie)
+            cachedObscuredCookie = nil
             showingLogin = false
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
             appendLog("夸克扫码登录成功，凭据已写入钥匙串")
@@ -236,6 +239,7 @@ final class AppModel: ObservableObject {
         do {
             stopInfuseBridge()
             try credentialStore.delete()
+            cachedObscuredCookie = nil
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
             appendLog("已从钥匙串删除夸克登录信息")
             refreshPreflight()
@@ -264,7 +268,9 @@ final class AppModel: ObservableObject {
             let mountSettings = settings
             let mountPath = mountSettings.mountPath
             let engine = URL(fileURLWithPath: enginePath)
-            try prepareRuntimeConfig(engine: engine)
+            if !FileManager.default.fileExists(atPath: paths.runtimeConfig.path) {
+                try prepareRuntimeConfig(engine: engine)
+            }
             let plan = MountPlanBuilder.make(settings: mountSettings, paths: paths, command: command)
             let process = Process()
             let stdout = Pipe()
@@ -504,6 +510,9 @@ final class AppModel: ObservableObject {
     }
 
     private func obscuredCookie(engine: URL) throws -> String {
+        if let cachedObscuredCookie {
+            return cachedObscuredCookie
+        }
         guard let cookie = try credentialStore.load(), !cookie.isEmpty else {
             throw QuarkLoginError.missingCookie
         }
@@ -517,7 +526,9 @@ final class AppModel: ObservableObject {
                 NSLocalizedDescriptionKey: result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
             ])
         }
-        return result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let obscured = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        cachedObscuredCookie = obscured
+        return obscured
     }
 
     func shutdownNow() {

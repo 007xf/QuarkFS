@@ -131,7 +131,7 @@ struct ContentView: View {
                 Divider()
                 checkRow(
                     title: "夸克账号",
-                    detail: model.preflight.hasCredential ? "登录信息已由 macOS 钥匙串保护" : "尚未登录",
+                    detail: model.preflight.hasCredential ? "已由钥匙串保护；首次弹窗请选择“始终允许”" : "尚未登录",
                     passed: model.preflight.hasCredential,
                     actionTitle: model.preflight.hasCredential ? "退出登录" : "扫码登录",
                     action: model.preflight.hasCredential ? model.forgetCredential : { model.showingLogin = true }
