@@ -8,7 +8,8 @@ if [[ -d "$COMPAT_SDK" ]]; then
 fi
 swift build --disable-sandbox --build-system native --product QuarkFSSmokeTests
 BIN_DIR="$(swift build --disable-sandbox --build-system native --show-bin-path)"
-swiftc -parse-as-library -I "$BIN_DIR/Modules" \
+swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
+  -I "$BIN_DIR/Modules" -I "$BIN_DIR" \
   Sources/QuarkFS/AppModel.swift Sources/QuarkFS/ShortcutPreferences.swift \
   Tests/QuarkFSCoreTests/AppBehaviorChecks.swift \
   "$BIN_DIR"/QuarkFSCore.build/*.o \
