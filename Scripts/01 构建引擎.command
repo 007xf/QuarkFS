@@ -17,18 +17,12 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-# 默认生成 Apple Silicon + Intel 通用引擎；调试时可用
-# QUARKFS_ARCHS="arm64" 或 QUARKFS_ARCHS="x86_64" 只构建一个架构。
-ARCHES=(arm64 x86_64)
-if [[ -n "${QUARKFS_ARCHS:-}" ]]; then
-  ARCHES=(${=QUARKFS_ARCHS})
+# QuarkFS 1.1 起仅支持 Apple Silicon。
+ARCHES=(arm64)
+if [[ -n "${QUARKFS_ARCHS:-}" && "$QUARKFS_ARCHS" != "arm64" ]]; then
+  print "当前版本仅支持 Apple Silicon（arm64）。"
+  exit 1
 fi
-for arch in "${ARCHES[@]}"; do
-  if [[ "$arch" != "arm64" && "$arch" != "x86_64" ]]; then
-    print "不支持的架构：$arch（只支持 arm64 或 x86_64）"
-    exit 1
-  fi
-done
 
 BUILD_TAGS=()
 CGO_MODE=0
@@ -40,7 +34,7 @@ else
 fi
 
 mkdir -p "$ENGINE_DIR"
-rm -f "$ENGINE_DIR/rclone" "$ENGINE_DIR/rclone-arm64" "$ENGINE_DIR/rclone-x86_64"
+
 
 ARCHIVE="$TEMP_SOURCE/rclone.tar.gz"
 curl -L --fail --retry 3 --connect-timeout 20 \
@@ -56,11 +50,8 @@ SOURCE_DIR="$TEMP_SOURCE/rclone-$PINNED_COMMIT"
 
 build_one() {
   local arch="$1"
-  local go_arch="amd64"
-  local output="$ENGINE_DIR/rclone-$arch"
-  if [[ "$arch" == "arm64" ]]; then
-    go_arch="arm64"
-  fi
+  local go_arch="arm64"
+  local output="$TEMP_SOURCE/rclone-$arch"
 
   print "正在构建 rclone 引擎（$arch）..."
   cd "$SOURCE_DIR"
@@ -70,8 +61,9 @@ build_one() {
       GOOS=darwin \
       GOARCH="$go_arch" \
       CC=clang \
-      CGO_CFLAGS="-arch $arch" \
-      CGO_LDFLAGS="-arch $arch" \
+      MACOSX_DEPLOYMENT_TARGET=14.0 \
+      CGO_CFLAGS="-arch $arch -mmacosx-version-min=14.0" \
+      CGO_LDFLAGS="-arch $arch -mmacosx-version-min=14.0" \
       go build "${BUILD_TAGS[@]}" -trimpath -ldflags "-s -w" -o "$output" .
   else
     env \
@@ -98,14 +90,8 @@ for arch in "${ARCHES[@]}"; do
   build_one "$arch"
 done
 
-if (( ${#ARCHES[@]} == 2 )); then
-  lipo -create \
-    "$ENGINE_DIR/rclone-arm64" \
-    "$ENGINE_DIR/rclone-x86_64" \
-    -output "$ENGINE_DIR/rclone"
-else
-  cp "$ENGINE_DIR/rclone-${ARCHES[1]}" "$ENGINE_DIR/rclone"
-fi
+cp "$TEMP_SOURCE/rclone-arm64" "$ENGINE_DIR/rclone-arm64"
+cp "$TEMP_SOURCE/rclone-arm64" "$ENGINE_DIR/rclone"
 chmod 755 "$ENGINE_DIR/rclone"
 
 print "QuarkFS 引擎已构建：$ENGINE_DIR/rclone"

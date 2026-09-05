@@ -16,15 +16,16 @@ if [[ -z "$ENGINE_ARCHES" ]]; then
   exit 1
 fi
 
-ARCHES=()
-if [[ "$ENGINE_ARCHES" == *arm64* ]]; then
-  ARCHES+=(arm64)
+ARCHES=(arm64)
+if [[ "$ENGINE_ARCHES" != *arm64* ]]; then
+  print "引擎必须支持 Apple Silicon（arm64）。"
+  exit 1
 fi
-if [[ "$ENGINE_ARCHES" == *x86_64* ]]; then
-  ARCHES+=(x86_64)
-fi
-if (( ${#ARCHES[@]} == 0 )); then
-  print "引擎必须包含 arm64 或 x86_64。"
+
+# Do not accidentally ship an engine that only runs on the build machine's OS.
+ENGINE_MIN_OS="$(otool -l -arch arm64 "$ENGINE" | awk '/minos / {print $2; exit}')"
+if [[ -z "$ENGINE_MIN_OS" || "${ENGINE_MIN_OS%%.*}" -gt 14 ]]; then
+  print "引擎要求 macOS $ENGINE_MIN_OS，请重新运行“01 构建引擎.command”，将最低版本设为 macOS 14。"
   exit 1
 fi
 
@@ -38,36 +39,38 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$PROJECT_DIR/.build/swift-cache"
 
 SWIFT_FLAGS=(--disable-sandbox --build-system native --manifest-cache local --cache-path "$PROJECT_DIR/.build/spm-cache")
 swift run "${SWIFT_FLAGS[@]}" QuarkFSSmokeTests
+"$PROJECT_DIR/Scripts/04 检查应用行为.command"
 
 build_swift() {
   local arch="$1"
   local scratch="$PROJECT_DIR/.build/swift-$arch"
   local triple="$arch-apple-macosx14.0"
-  print "正在构建 Swift 应用（$arch）..."
-  swift build "${SWIFT_FLAGS[@]}" --scratch-path "$scratch" -c release --triple "$triple"
+  print -u2 "正在构建 Swift 应用（$arch）..."
+  swift build "${SWIFT_FLAGS[@]}" --scratch-path "$scratch" -c release --triple "$triple" >&2
   print -r -- "$(swift build "${SWIFT_FLAGS[@]}" --scratch-path "$scratch" -c release --triple "$triple" --show-bin-path)/QuarkFS"
 }
 
 MAIN_BINARIES=()
 for arch in "${ARCHES[@]}"; do
-  MAIN_BINARIES+=("$(build_swift "$arch" | tail -1)")
+  MAIN_BINARIES+=("$(build_swift "$arch")")
 done
 
-TEMP_MAIN="$PROJECT_DIR/.build/QuarkFS-universal"
-if (( ${#MAIN_BINARIES[@]} == 2 )); then
-  lipo -create "${MAIN_BINARIES[@]}" -output "$TEMP_MAIN"
-else
-  cp "${MAIN_BINARIES[1]}" "$TEMP_MAIN"
-fi
+TEMP_MAIN="$PROJECT_DIR/.build/QuarkFS-arm64"
+cp "${MAIN_BINARIES[1]}" "$TEMP_MAIN"
 
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/Engine" "$APP_DIR/Contents/Resources/Documentation"
 cp "$TEMP_MAIN" "$APP_DIR/Contents/MacOS/QuarkFS"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
-cp "$ENGINE" "$APP_DIR/Contents/Resources/Engine/rclone"
+if [[ "$ENGINE_ARCHES" == "arm64" ]]; then
+  cp "$ENGINE" "$APP_DIR/Contents/Resources/Engine/rclone"
+else
+  lipo "$ENGINE" -thin arm64 -output "$APP_DIR/Contents/Resources/Engine/rclone"
+fi
 cp "$PROJECT_DIR/README.md" "$APP_DIR/Contents/Resources/Documentation/README.md"
 cp "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$APP_DIR/Contents/Resources/Documentation/THIRD_PARTY_NOTICES.md"
+cp "$PROJECT_DIR/05 更新记录.md" "$APP_DIR/Contents/Resources/Documentation/CHANGELOG.md"
 cp "$PROJECT_DIR/LICENSE" "$APP_DIR/Contents/Resources/Documentation/LICENSE"
 cp "$PROJECT_DIR/01 项目说明.md" "$APP_DIR/Contents/Resources/Documentation/PROJECT_OVERVIEW.md"
 cp "$PROJECT_DIR/02 安装与使用.md" "$APP_DIR/Contents/Resources/Documentation/INSTALL.md"

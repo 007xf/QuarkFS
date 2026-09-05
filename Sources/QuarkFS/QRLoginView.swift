@@ -10,20 +10,30 @@ final class QRLoginViewModel: ObservableObject {
     @Published var isWorking = true
     @Published var errorText: String?
 
-    private let client = QuarkLoginClient()
     private var task: Task<Void, Never>?
+    private var attempt = UUID()
 
     func start(onSuccess: @escaping (String) -> Void) {
         task?.cancel()
+        attempt = UUID()
+        let currentAttempt = attempt
+        scanURL = nil
+        errorText = nil
+        isWorking = true
+        statusText = "正在生成登录二维码…"
         task = Task {
+            let client = QuarkLoginClient()
             do {
                 let login = try await client.start()
+                try Task.checkCancellation()
                 scanURL = login.scanURL
                 statusText = "请使用夸克 App 扫码并在手机上确认"
 
                 let deadline = Date().addingTimeInterval(120)
                 while !Task.isCancelled, Date() < deadline {
-                    switch try await client.poll(login) {
+                    let result = try await client.poll(login)
+                    try Task.checkCancellation()
+                    switch result {
                     case .waitingForScan:
                         statusText = "等待扫码…"
                     case .waitingForConfirmation:
@@ -31,6 +41,7 @@ final class QRLoginViewModel: ObservableObject {
                     case .authorized(let ticket):
                         statusText = "正在完成登录…"
                         let cookie = try await client.finish(serviceTicket: ticket)
+                        try Task.checkCancellation()
                         isWorking = false
                         onSuccess(cookie)
                         return
@@ -43,7 +54,9 @@ final class QRLoginViewModel: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
+                guard !Task.isCancelled, currentAttempt == attempt else { return }
                 isWorking = false
+                scanURL = nil
                 errorText = error.localizedDescription
                 statusText = "登录未完成"
             }

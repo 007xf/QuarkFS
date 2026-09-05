@@ -47,14 +47,17 @@ public final class QuarkLoginClient: @unchecked Sendable {
     private let pan = URL(string: "https://pan.quark.cn")!
     private let drive = URL(string: "https://drive-pc.quark.cn")!
 
-    public init() {
-        storage = .sharedCookieStorage(forGroupContainerIdentifier: "com.holmes.QuarkFS.Login")
-        let configuration = URLSessionConfiguration.ephemeral
+    public init(configuration: URLSessionConfiguration = .ephemeral) {
+        // Keep login cookies in this session's memory, never a shared disk jar.
+        let configuration = configuration.copy() as! URLSessionConfiguration
+        storage = URLSessionConfiguration.ephemeral.httpCookieStorage!
         configuration.httpCookieStorage = storage
         configuration.httpShouldSetCookies = true
         configuration.httpCookieAcceptPolicy = .always
         session = URLSession(configuration: configuration)
     }
+
+    deinit { session.invalidateAndCancel() }
 
     public func start() async throws -> QuarkQRCodeSession {
         let requestID = Self.randomString(length: 32)
@@ -140,7 +143,14 @@ public final class QuarkLoginClient: @unchecked Sendable {
             URLQueryItem(name: "_page", value: "1"),
             URLQueryItem(name: "_size", value: "1")
         ]
-        let _: GenericResponse = try await getJSON(listing.url!, origin: pan)
+        let listingResponse: GenericResponse = try await getJSON(listing.url!, origin: pan)
+        guard listingResponse.code == 0,
+              listingResponse.status == nil || listingResponse.status == 0 || listingResponse.status == 200 else {
+            throw QuarkLoginError.provider(
+                status: listingResponse.code ?? listingResponse.status ?? -1,
+                message: listingResponse.message ?? "网盘会话验证失败，请重新登录"
+            )
+        }
 
         var values: [String] = []
         var seen: Set<String> = []

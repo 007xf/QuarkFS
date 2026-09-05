@@ -110,4 +110,111 @@ check(
     "未加载 macFUSE 时不应报告就绪"
 )
 
-print("PASS: QuarkFS 核心冒烟测试全部通过")
+// Large writes to both pipes must finish without waiting for a full pipe.
+let noisy = try ProcessRunner.run(
+    executable: URL(fileURLWithPath: "/bin/zsh"),
+    arguments: ["-c", "for i in {1..6000}; do print 'abcdefghijklmnopqrstuvwxyz0123456789'; print -u2 'abcdefghijklmnopqrstuvwxyz0123456789'; done"],
+    timeout: 10
+)
+check(noisy.status == 0 && noisy.standardOutput.utf8.count > 200_000 && noisy.standardError.utf8.count > 200_000,
+      "大量标准输出和错误输出不能让进程死锁")
+let echoInput = Data(repeating: 0x41, count: 200_000)
+let echoed = try ProcessRunner.run(executable: URL(fileURLWithPath: "/bin/cat"), arguments: [], input: echoInput)
+check(Data(echoed.standardOutput.utf8) == echoInput, "子进程输入与输出必须可同时排空")
+let started = Date()
+do {
+    _ = try ProcessRunner.run(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["20"], timeout: 0.1)
+    check(false, "无响应命令必须超时")
+} catch ProcessRunnerError.timedOut {}
+check(Date().timeIntervalSince(started) < 4, "超时不能无限等待子进程")
+
+let outside = temporaryRoot.appendingPathComponent("Outside")
+try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+let sentinel = outside.appendingPathComponent("keep.txt")
+try Data("keep".utf8).write(to: sentinel)
+let linkedCache = temporaryRoot.appendingPathComponent("LinkedCache")
+try FileManager.default.createSymbolicLink(at: linkedCache, withDestinationURL: outside)
+for root in [linkedCache, linkedCache.appendingPathComponent("Child")] {
+    do {
+        try SafeCacheManager(cacheRoot: root, allowedParent: temporaryRoot).clear()
+        check(false, "缓存根目录及祖先链接必须拒绝清理")
+    } catch SafeCacheError.unsafePath {}
+}
+check(FileManager.default.fileExists(atPath: sentinel.path), "符号链接不能导致外部文件被删除")
+let nestedLink = paths.cacheDirectory.appendingPathComponent("ExternalLink")
+try FileManager.default.createSymbolicLink(at: nestedLink, withDestinationURL: outside)
+try cacheManager.clear()
+check(FileManager.default.fileExists(atPath: sentinel.path), "缓存内链接只能删除链接本身")
+try SafeCacheManager(cacheRoot: paths.cacheDirectory, allowedParent: URL(fileURLWithPath: temporaryRoot.path, isDirectory: false)).validateRoot()
+let hiddenCache = paths.cacheDirectory.appendingPathComponent(".hidden.bin")
+try Data(repeating: 0x42, count: 8192).write(to: hiddenCache)
+check(cacheManager.allocatedBytes() > 0, "隐藏文件也应计入磁盘缓存")
+
+let sandboxHome = temporaryRoot.appendingPathComponent("Home")
+let support = sandboxHome.appendingPathComponent("Library/Application Support/QuarkFS")
+try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+let newMount = sandboxHome.appendingPathComponent("New Mount")
+_ = try MountDirectory.validate(path: newMount.path, home: sandboxHome, supportDirectory: support)
+check(!FileManager.default.fileExists(atPath: newMount.path), "检查挂载路径不得创建目录")
+for badPath in [sandboxHome.path, outside.path, support.path, sandboxHome.appendingPathComponent("Library").path] {
+    do {
+        _ = try MountDirectory.validate(path: badPath, home: sandboxHome, supportDirectory: support)
+        check(false, "不能覆盖个人目录、外部目录或应用数据")
+    } catch is MountDirectoryError {}
+}
+let nonempty = sandboxHome.appendingPathComponent("Documents")
+try FileManager.default.createDirectory(at: nonempty, withIntermediateDirectories: true)
+try Data("keep".utf8).write(to: nonempty.appendingPathComponent("existing.txt"))
+do {
+    _ = try MountDirectory.validate(path: nonempty.path, home: sandboxHome, supportDirectory: support)
+    check(false, "不能挂载到包含文件的目录")
+} catch MountDirectoryError.notEmpty {}
+let escape = sandboxHome.appendingPathComponent("Escape")
+try FileManager.default.createSymbolicLink(at: escape, withDestinationURL: outside)
+do {
+    _ = try MountDirectory.validate(path: escape.appendingPathComponent("Mount").path, home: sandboxHome, supportDirectory: support)
+    check(false, "挂载路径不能通过符号链接越过个人目录")
+} catch MountDirectoryError.outsideHome {}
+let dangling = sandboxHome.appendingPathComponent("Dangling")
+try FileManager.default.createSymbolicLink(at: dangling, withDestinationURL: outside.appendingPathComponent("Missing"))
+do {
+    _ = try MountDirectory.validate(path: dangling.appendingPathComponent("Mount").path, home: sandboxHome, supportDirectory: support)
+    check(false, "不存在目标的符号链接也必须拒绝")
+} catch MountDirectoryError.outsideHome {}
+
+let oldSettings = Data("{\"mountPath\":\"/Users/example/Quark\",\"profile\":\"balanced\",\"autoCleanup\":false,\"cleanupDelaySeconds\":120,\"openFinderAfterMount\":false}".utf8)
+let migrated = try JSONDecoder().decode(AppSettings.self, from: oldSettings)
+check(migrated.infusePort == 8686 && migrated.profile == .balanced && !migrated.autoCleanup,
+      "升级旧设置必须保留缓存偏好并补充默认端口")
+let custom = AppSettings(infusePort: 9999)
+check(InfusePlanBuilder.make(settings: custom, paths: paths).contains("127.0.0.1:9999"), "自定义端口必须始终绑定回环地址")
+let roundtrip = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(custom))
+check(roundtrip == custom, "自定义连接设置应可持久化")
+check(AppSettings(infusePort: 0).infusePort == 8686, "无效端口不能传入引擎")
+
+let validDAV = Data("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:propstat><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".utf8)
+check(WebDAVHealth.evaluate(status: 207, data: validDAV) == .ready, "成功的 WebDAV 目录响应应通过检查")
+check(WebDAVHealth.evaluate(status: 200, data: Data("<html>other server</html>".utf8)) != .ready, "其他 HTTP 服务不能被误报为 Infuse 已就绪")
+check(WebDAVHealth.evaluate(status: 207, data: Data("error".utf8)) != .ready, "无效的目录响应不能报就绪")
+check(WebDAVHealth.evaluate(status: 403, data: Data()) != .ready, "账号认证失败不能报就绪")
+
+let loginConfiguration = URLSessionConfiguration.ephemeral
+loginConfiguration.protocolClasses = [LoginFailureProtocol.self]
+let loginClient = QuarkLoginClient(configuration: loginConfiguration)
+do {
+    _ = try await loginClient.finish(serviceTicket: "test-only")
+    check(false, "网盘返回业务错误时不能把扫码登录报告为成功")
+} catch QuarkLoginError.provider(let status, _) {
+    check(status == 31001, "登录失败应保留业务错误码")
+}
+
+let zeroStatusConfiguration = URLSessionConfiguration.ephemeral
+zeroStatusConfiguration.protocolClasses = [LoginZeroStatusProtocol.self]
+do {
+    _ = try await QuarkLoginClient(configuration: zeroStatusConfiguration).finish(serviceTicket: "test-only")
+    check(false, "没有 Cookie 时不能完成登录")
+} catch QuarkLoginError.missingCookie {
+    // The upstream API also accepts status 0. It must reach the cookie check.
+}
+
+print("PASS: QuarkFS 核心回归测试全部通过（挂载、缓存边界、进程、登录、设置迁移、WebDAV）")

@@ -2,6 +2,8 @@
 .build/
 DerivedData/
 *.xcuserstate
+__pycache__/
+*.pyc
 QuarkFS.app/
 
 # Previous menu-bar bitmap experiments are kept locally for reference only;

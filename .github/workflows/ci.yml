@@ -20,21 +20,20 @@ jobs:
           zsh -n "Scripts/01 构建引擎.command"
           zsh -n "Scripts/02 打包应用.command"
           zsh -n "Scripts/03 生成发布包.command"
+          zsh -n "Scripts/04 检查应用行为.command"
 
       - name: Run core smoke test
         run: swift run --disable-sandbox --build-system native --scratch-path .build/ci-smoke QuarkFSSmokeTests
 
+      - name: Check application lifecycle without a cloud account
+        run: |
+          "Scripts/04 检查应用行为.command"
+
       - name: Build Apple Silicon app
         run: swift build --disable-sandbox --build-system native --scratch-path .build/ci-arm64 -c release --triple arm64-apple-macosx14.0
 
-      - name: Build Intel app
-        run: swift build --disable-sandbox --build-system native --scratch-path .build/ci-x86_64 -c release --triple x86_64-apple-macosx14.0
-
-      - name: Verify both app architectures
+      - name: Verify Apple Silicon app architecture
         run: |
           ARM_BIN=".build/ci-arm64/arm64-apple-macosx/release/QuarkFS"
-          INTEL_BIN=".build/ci-x86_64/x86_64-apple-macosx/release/QuarkFS"
           test -x "$ARM_BIN"
-          test -x "$INTEL_BIN"
           test "$(lipo -archs "$ARM_BIN")" = "arm64"
-          test "$(lipo -archs "$INTEL_BIN")" = "x86_64"

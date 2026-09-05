@@ -4,6 +4,7 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    @StateObject private var draft = ConnectionDraft()
 
     var body: some View {
         ScrollView {
@@ -20,11 +21,19 @@ struct ContentView: View {
             .padding(24)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .frame(minWidth: 720, minHeight: 720)
-        .onAppear { model.bootstrap() }
-        .onChange(of: model.settings) { _, _ in model.persistSettings() }
+        .frame(minWidth: 720, minHeight: 560)
+        .task {
+            draft.mountPathInput = model.settings.mountPath
+            draft.infusePortInput = String(model.settings.infusePort)
+            await model.bootstrap()
+        }
+        .onChange(of: model.settings) { _, _ in
+            Task { await model.persistSettings() }
+        }
+        .onChange(of: model.settings.mountPath) { _, path in draft.mountPathInput = path }
+        .onChange(of: model.settings.infusePort) { _, port in draft.infusePortInput = String(port) }
         .sheet(isPresented: $model.showingLogin) {
-            QRLoginView(onSuccess: model.saveCookieFromQR)
+            QRLoginView { cookie in Task { await model.saveCookieFromQR(cookie) } }
         }
     }
 
@@ -38,7 +47,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("QuarkFS")
                     .font(.largeTitle.bold())
-                Text("把夸克网盘变成 Mac 本地磁盘，供 Infuse 直接读取")
+                Text("Finder 本地磁盘 · Infuse 本机连接")
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -58,12 +67,24 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("挂载位置")
                             .font(.headline)
-                        TextField("挂载目录", text: $model.settings.mountPath)
+                        TextField("挂载目录", text: $draft.mountPathInput)
                             .textFieldStyle(.roundedBorder)
                             .disabled(!model.canEditMountPath)
+                            .onSubmit { Task { await model.applyMountPath(draft.mountPathInput) } }
                     }
+                    Button("应用") { Task { await model.applyMountPath(draft.mountPathInput) } }
+                        .disabled(!model.canEditMountPath || draft.mountPathInput == model.settings.mountPath)
+                    Button("选择…") { model.chooseMountFolder() }
+                        .disabled(!model.canEditMountPath)
                     Button("在 Finder 中打开") { model.openMountFolder() }
                         .disabled(!model.preflight.mountDirectoryReady)
+                }
+
+                if let problem = model.preflight.mountDirectoryProblem {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 Divider()
@@ -80,12 +101,12 @@ struct ContentView: View {
                     if model.shouldOfferUnmount {
                         Button("卸载", role: .destructive) { model.unmount() }
                             .controlSize(.large)
-                            .disabled(model.status == .unmounting)
+                            .disabled(model.status == .unmounting || model.isBusy)
                     } else {
-                        Button("挂载 Quark") { model.mount() }
+                        Button("挂载 Quark") { Task { await model.mount() } }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.large)
-                            .disabled(!model.preflight.ready || model.mountOperationInProgress)
+                            .disabled(!model.preflight.ready || model.mountOperationInProgress || model.isBusy || model.isChecking)
                     }
                 }
 
@@ -97,14 +118,42 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Infuse 本机连接")
                             .font(.headline)
-                        Text(model.infuseBridgeRunning ? "已就绪 · 127.0.0.1:8686" : "尚未运行")
+                        Text(model.infuseBridgeDetail)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("重新启动") { model.restartInfuseBridge() }
-                        .disabled(!model.preflight.hasCredential || !model.preflight.engine.isQuarkCapable)
+                    if model.isBusy { ProgressView().controlSize(.small) }
+                    if model.infuseBridgeActive {
+                        Button("停止") { Task { await model.disconnectInfuseBridge() } }
+                            .disabled(model.isBusy)
+                    }
+                    Button(model.infuseBridgeActive ? "重新启动" : "启动连接") {
+                        Task { await model.restartInfuseBridge() }
+                    }
+                    .disabled(!model.preflight.hasCredential || !model.preflight.engine.isQuarkCapable || model.isBusy || model.isChecking)
                 }
+
+                HStack {
+                    Text("端口")
+                    TextField("8686", text: $draft.infusePortInput)
+                        .frame(width: 70)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(model.isBusy)
+                        .onSubmit { Task { await model.applyInfusePort(draft.infusePortInput) } }
+                    Button("应用端口") { Task { await model.applyInfusePort(draft.infusePortInput) } }
+                        .disabled(model.isBusy || draft.infusePortInput == String(model.settings.infusePort))
+                    Spacer()
+                    Button("复制连接信息") { model.copyInfuseConnection() }
+                    Button("打开 Infuse") { model.openInfuse() }
+                }
+                Text("Infuse 连接可独立使用，无需先挂载磁盘。更改端口后，请同步更新 Infuse 中的设置。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Toggle("挂载后自动打开 Finder", isOn: $model.settings.openFinderAfterMount)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .disabled(model.isBusy)
             }
             .padding(6)
         } label: {
@@ -126,7 +175,10 @@ struct ContentView: View {
                     detail: macFUSEDetail,
                     passed: model.preflight.macFUSEReady,
                     actionTitle: model.preflight.macFUSEReady ? nil : (model.preflight.macFUSEInstalled ? "重新检查" : "获取 macFUSE"),
-                    action: model.preflight.macFUSEInstalled ? model.refreshPreflight : model.openMacFUSEWebsite
+                    action: {
+                        if model.preflight.macFUSEInstalled { Task { await model.refreshPreflight() } }
+                        else { model.openMacFUSEWebsite() }
+                    }
                 )
                 Divider()
                 checkRow(
@@ -134,15 +186,20 @@ struct ContentView: View {
                     detail: model.preflight.hasCredential ? "已由钥匙串保护；首次弹窗请选择“始终允许”" : "尚未登录",
                     passed: model.preflight.hasCredential,
                     actionTitle: model.preflight.hasCredential ? "退出登录" : "扫码登录",
-                    action: model.preflight.hasCredential ? model.forgetCredential : { model.showingLogin = true }
+                    action: {
+                        if model.preflight.hasCredential { Task { await model.forgetCredential() } }
+                        else { model.showingLogin = true }
+                    }
                 )
+                .disabled(!model.canEditMountPath)
 
                 if !model.preflight.hasCredential {
                     DisclosureGroup("无法扫码？使用 Cookie 登录") {
                         HStack {
                             SecureField("粘贴完整 Cookie", text: $model.cookieInput)
                                 .textFieldStyle(.roundedBorder)
-                            Button("保存到钥匙串") { model.saveCookie() }
+                            Button("保存到钥匙串") { Task { await model.saveCookie() } }
+                                .disabled(model.isBusy || model.cookieInput.isEmpty)
                         }
                         .padding(.top, 8)
                     }
@@ -188,12 +245,12 @@ struct ContentView: View {
                     }
                     Spacer()
                     Button("刷新") { model.refreshCacheUsage() }
-                    Button("清理全部缓存", role: .destructive) { model.clearCache() }
+                    Button("清理全部缓存", role: .destructive) { Task { await model.clearCache() } }
                         .disabled(!model.canClearCache)
                 }
 
                 if model.settings.profile != .zeroResidual {
-                    Text("缓存上限仅对已关闭的文件严格生效；正在播放的文件可能短时超过上限。最省空间请使用“零残留”。")
+                    Text("磁盘挂载与 Infuse 分别计算缓存上限。正在播放的文件可能超过上限；清理缓存会短暂中断 Infuse 连接。最省空间请使用“零残留”。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -234,7 +291,8 @@ struct ContentView: View {
             Image(systemName: "exclamationmark.triangle.fill")
             Text(message)
             Spacer()
-            Button("重新检查") { model.refreshPreflight() }
+            Button(model.isChecking ? "检查中…" : "重新检查") { Task { await model.refreshPreflight() } }
+                .disabled(model.isChecking)
         }
         .foregroundStyle(.orange)
         .padding(12)
@@ -277,4 +335,9 @@ struct ContentView: View {
         if model.preflight.macFUSEInstalled { return "已安装，但系统扩展尚未加载；请在隐私与安全性中允许后重启" }
         return "需要安装并在系统设置中允许"
     }
+}
+
+private final class ConnectionDraft: ObservableObject {
+    @Published var mountPathInput = ""
+    @Published var infusePortInput = ""
 }

@@ -14,13 +14,11 @@ if [[ ! -d "$APP_DIR" ]]; then
 fi
 
 APP_ARCHES="$(lipo -archs "$APP_DIR/Contents/MacOS/QuarkFS")"
-if [[ "$APP_ARCHES" == *arm64* && "$APP_ARCHES" == *x86_64* ]]; then
-  ARCHIVE_NAME="QuarkFS-macOS-universal.zip"
-elif [[ "$APP_ARCHES" == *arm64* ]]; then
-  ARCHIVE_NAME="QuarkFS-macOS-arm64.zip"
-else
-  ARCHIVE_NAME="QuarkFS-macOS-x86_64.zip"
+if [[ "$APP_ARCHES" != "arm64" ]]; then
+  print "发布包必须只包含 Apple Silicon（arm64）。"
+  exit 1
 fi
+ARCHIVE_NAME="QuarkFS-macOS-arm64.zip"
 
 mkdir -p "$RELEASE_DIR"
 rm -f "$RELEASE_DIR/$ARCHIVE_NAME" "$RELEASE_DIR/$ARCHIVE_NAME.sha256"

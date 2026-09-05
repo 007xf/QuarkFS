@@ -7,7 +7,7 @@ struct QuarkFSApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("QuarkFS", id: "main") {
+        Window("QuarkFS", id: "main") {
             ContentView(model: model)
                 .onAppear { appDelegate.model = model }
         }
@@ -56,11 +56,11 @@ private struct QuarkFSCommands: Commands {
                 if isConnected {
                     model.unmount()
                 } else {
-                    model.mount()
+                    Task { await model.mount() }
                 }
             }
             .appShortcut(model.shortcut(for: .toggleMount))
-            .disabled(isConnected ? model.status == .unmounting : (!model.preflight.ready || model.mountOperationInProgress))
+            .disabled(model.isBusy || model.isChecking || (isConnected ? model.status == .unmounting : (!model.preflight.ready || model.mountOperationInProgress)))
 
             Button("在 Finder 中打开") {
                 model.openMountFolder()
@@ -69,13 +69,13 @@ private struct QuarkFSCommands: Commands {
             .disabled(!model.preflight.mountDirectoryReady)
 
             Button("重新检查") {
-                model.refreshPreflight()
+                Task { await model.refreshPreflight() }
                 model.refreshCacheUsage()
             }
             .appShortcut(model.shortcut(for: .refresh))
 
             Button("清理全部缓存") {
-                model.clearCache()
+                Task { await model.clearCache() }
             }
             .appShortcut(model.shortcut(for: .clearCache))
             .disabled(!model.canClearCache)
@@ -312,13 +312,13 @@ private struct MenuBarContent: View {
                 model.unmount()
             }
             .appShortcut(model.shortcut(for: .toggleMount))
-            .disabled(model.status == .unmounting)
+            .disabled(model.status == .unmounting || model.isBusy)
         } else {
             Button("挂载 Quark") {
-                model.mount()
+                Task { await model.mount() }
             }
             .appShortcut(model.shortcut(for: .toggleMount))
-            .disabled(!model.preflight.ready || model.mountOperationInProgress)
+            .disabled(!model.preflight.ready || model.mountOperationInProgress || model.isBusy || model.isChecking)
         }
 
         Button("在 Finder 中打开") {
@@ -328,16 +328,29 @@ private struct MenuBarContent: View {
         .disabled(!model.preflight.mountDirectoryReady)
 
         Button("重新检查") {
-            model.refreshPreflight()
+            Task { await model.refreshPreflight() }
             model.refreshCacheUsage()
         }
         .appShortcut(model.shortcut(for: .refresh))
 
         Button("清理磁盘缓存") {
-            model.clearCache()
+            Task { await model.clearCache() }
         }
         .appShortcut(model.shortcut(for: .clearCache))
         .disabled(!model.canClearCache)
+
+        Divider()
+
+        Text("Infuse · \(model.infuseBridgeDetail)")
+        Button(model.infuseBridgeActive ? "停止 Infuse 连接" : "启动 Infuse 连接") {
+            Task {
+                if model.infuseBridgeActive { await model.disconnectInfuseBridge() }
+                else { await model.restartInfuseBridge() }
+            }
+        }
+        .disabled(model.isBusy || !model.preflight.hasCredential || !model.preflight.engine.isQuarkCapable)
+        Button("复制 Infuse 连接信息") { model.copyInfuseConnection() }
+        Button("打开 Infuse") { model.openInfuse() }
 
         Divider()
 
@@ -348,7 +361,6 @@ private struct MenuBarContent: View {
         Divider()
 
         Button("退出 QuarkFS") {
-            model.shutdownNow()
             NSApplication.shared.terminate(nil)
         }
         .keyboardShortcut("q")
@@ -386,7 +398,9 @@ private extension View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
-    func applicationWillTerminate(_ notification: Notification) {
-        model?.shutdownNow()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model else { return .terminateNow }
+        Task { sender.reply(toApplicationShouldTerminate: await model.shutdownNow()) }
+        return .terminateLater
     }
 }

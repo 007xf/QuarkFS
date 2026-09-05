@@ -30,7 +30,7 @@ enum MountStatus: Equatable {
 
 }
 
-struct PreflightState {
+struct PreflightState: Sendable {
     var engine = EngineInspection(
         path: nil,
         isQuarkCapable: false,
@@ -42,6 +42,7 @@ struct PreflightState {
     var macFUSEReady = false
     var hasCredential = false
     var mountDirectoryReady = false
+    var mountDirectoryProblem: String?
 
     var ready: Bool {
         engine.isQuarkCapable && engine.mountCommand == "cmount" && macFUSEReady && hasCredential && mountDirectoryReady
@@ -55,13 +56,17 @@ final class AppModel: ObservableObject {
     @Published private(set) var preflight = PreflightState()
     @Published private(set) var cacheBytes: Int64 = 0
     @Published private(set) var infuseBridgeRunning = false
+    @Published private(set) var infuseBridgeActive = false
     @Published private(set) var hasActiveMount = false
+    @Published private(set) var isBusy = false
+    @Published private(set) var isChecking = false
+    @Published private(set) var infuseBridgeDetail = "尚未运行"
     @Published private(set) var shortcuts: ShortcutPreferences
     @Published private(set) var logs: [String] = []
     @Published var cookieInput = ""
     @Published var showingLogin = false
 
-    let paths = AppPaths()
+    let paths: AppPaths
 
     private let credentialStore: any CredentialStoring
     private let defaults: UserDefaults
@@ -72,11 +77,14 @@ final class AppModel: ObservableObject {
     private var activeMountPath: String?
     private var infuseBridgeSettings: AppSettings?
     private var cachedObscuredCookie: String?
+    private var hasBootstrapped = false
+    private var isShuttingDown = false
+    private var preflightRevision = 0
     private let settingsKey = "QuarkFS.settings.v1"
     private let shortcutsKey = "QuarkFS.shortcuts.v1"
 
     var mountOperationInProgress: Bool {
-        status == .mounting || status == .unmounting
+        status == .mounting || status == .unmounting || (engineProcess?.isRunning == true && !hasActiveMount)
     }
 
     var shouldOfferUnmount: Bool {
@@ -84,19 +92,21 @@ final class AppModel: ObservableObject {
     }
 
     var canEditMountPath: Bool {
-        !hasActiveMount && !mountOperationInProgress
+        !hasActiveMount && !mountOperationInProgress && !isBusy
     }
 
     var canClearCache: Bool {
-        !hasActiveMount && !mountOperationInProgress
+        !hasActiveMount && !mountOperationInProgress && !isBusy
     }
 
     init(
         credentialStore: any CredentialStoring = KeychainCredentialStore(),
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        paths: AppPaths = AppPaths()
     ) {
         self.credentialStore = credentialStore
         self.defaults = defaults
+        self.paths = paths
         if let data = defaults.data(forKey: settingsKey),
            let decoded = try? JSONDecoder().decode(AppSettings.self, from: data) {
             settings = decoded
@@ -151,106 +161,183 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func bootstrap() {
+    func bootstrap() async {
+        guard !hasBootstrapped else { return }
+        hasBootstrapped = true
         do {
             try paths.prepare()
-            try prepareMountDirectory()
         } catch {
             status = .failed(error.localizedDescription)
             appendLog("初始化失败：\(error.localizedDescription)")
         }
-        refreshPreflight()
+        await refreshPreflight()
         refreshCacheUsage()
-        startInfuseBridge()
+        await restartInfuseBridge()
     }
 
-    func persistSettings() {
-        let shouldRestartBridge = infuseBridgeRunning && infuseBridgeSettings.map {
+    func persistSettings() async {
+        let shouldRestartBridge = infuseBridgeProcess?.isRunning == true && infuseBridgeSettings.map {
             $0.profile != settings.profile
                 || $0.autoCleanup != settings.autoCleanup
                 || $0.cleanupDelaySeconds != settings.cleanupDelaySeconds
+                || $0.infusePort != settings.infusePort
         } == true
         if let data = try? JSONEncoder().encode(settings) {
             defaults.set(data, forKey: settingsKey)
         }
-        do {
-            try prepareMountDirectory()
-        } catch {
-            status = .failed(error.localizedDescription)
-        }
-        refreshPreflight()
         if shouldRestartBridge {
-            restartInfuseBridge()
+            await restartInfuseBridge()
         }
     }
 
-    func refreshPreflight() {
-        let engineURL = EngineLocator.locate()
-        preflight.engine = EngineLocator.inspect(engineURL)
-        preflight.macFUSEInstalled = EngineLocator.isMacFUSEInstalled
-        preflight.macFUSEReady = EngineLocator.isMacFUSEReady
-        preflight.hasCredential = (try? credentialStore.contains()) == true
-        var isDirectory: ObjCBool = false
-        preflight.mountDirectoryReady = FileManager.default.fileExists(
-            atPath: settings.mountPath,
-            isDirectory: &isDirectory
-        ) && isDirectory.boolValue
+    func refreshPreflight() async {
+        preflightRevision += 1
+        let revision = preflightRevision
+        isChecking = true
+        let mountPath = activeMountPath ?? settings.mountPath
+        let support = paths.supportDirectory
+        let store = credentialStore
+        let snapshot = await Task.detached {
+            var result = PreflightState()
+            result.engine = EngineLocator.inspect(EngineLocator.locate())
+            result.macFUSEInstalled = EngineLocator.isMacFUSEInstalled
+            result.macFUSEReady = EngineLocator.isMacFUSEReady
+            result.hasCredential = (try? store.contains()) == true
+            let mounts = try? ProcessRunner.run(executable: URL(fileURLWithPath: "/sbin/mount"), arguments: [])
+            if MountDetector.presence(output: mounts?.standardOutput ?? "", path: mountPath) == .quark {
+                result.mountDirectoryReady = true
+            } else {
+                do {
+                    _ = try MountDirectory.validate(path: mountPath, supportDirectory: support)
+                    result.mountDirectoryReady = true
+                } catch {
+                    result.mountDirectoryProblem = error.localizedDescription
+                }
+            }
+            return result
+        }.value
+        guard revision == preflightRevision else { return }
+        preflight = snapshot
+        isChecking = false
         refreshMountStatus()
     }
 
-    func saveCookie() {
+    func applyMountPath(_ path: String) async {
+        guard canEditMountPath else { return }
+        do {
+            let url = try MountDirectory.validate(path: path, supportDirectory: paths.supportDirectory)
+            settings.mountPath = url.path
+            await persistSettings()
+            status = .notMounted
+            await refreshPreflight()
+        } catch {
+            status = .failed(error.localizedDescription)
+        }
+    }
+
+    func chooseMountFolder() {
+        guard canEditMountPath else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "设为挂载位置"
+        panel.message = "选择个人文件夹内的空文件夹"
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor [weak self] in await self?.applyMountPath(url.path) }
+        }
+    }
+
+    func applyInfusePort(_ text: String) async {
+        guard !isBusy else { return }
+        guard let port = Int(text), (1024...65535).contains(port) else {
+            infuseBridgeDetail = "端口应为 1024–65535 之间的整数"
+            return
+        }
+        settings.infusePort = port
+        await persistSettings()
+    }
+
+    func copyInfuseConnection() {
+        let text = "WebDAV\n服务器：127.0.0.1\n端口：\(settings.infusePort)\n路径：/\nHTTPS：关闭\n用户名和密码：留空"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        appendLog("Infuse 连接信息已复制")
+    }
+
+    func openInfuse() {
+        let app = URL(fileURLWithPath: "/Applications/Infuse.app")
+        if FileManager.default.fileExists(atPath: app.path) {
+            NSWorkspace.shared.openApplication(at: app, configuration: .init()) { _, _ in }
+        } else {
+            NSWorkspace.shared.open(URL(string: "https://firecore.com/infuse")!)
+        }
+    }
+
+    func disconnectInfuseBridge() async {
+        guard !isBusy, !isShuttingDown else { return }
+        isBusy = true
+        defer { isBusy = false }
+        _ = await stopInfuseBridge()
+    }
+
+    func saveCookie() async {
         let cookie = cookieInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cookie.isEmpty else {
             status = .failed("请粘贴完整的夸克 Cookie")
             return
         }
+        await saveCredential(cookie, message: "登录信息已保存到 macOS 钥匙串")
+    }
+
+    func saveCookieFromQR(_ cookie: String) async {
+        await saveCredential(cookie, message: "夸克扫码登录成功，凭据已写入钥匙串")
+    }
+
+    private func saveCredential(_ cookie: String, message: String) async {
+        guard canEditMountPath else { return }
+        isBusy = true
+        defer { isBusy = false }
         do {
+            guard await stopInfuseBridge() else { return }
             try credentialStore.save(cookie)
             cachedObscuredCookie = nil
             cookieInput = ""
-            try? FileManager.default.removeItem(at: paths.runtimeConfig)
-            appendLog("登录信息已保存到 macOS 钥匙串")
-            refreshPreflight()
-            restartInfuseBridge()
-        } catch {
-            status = .failed(error.localizedDescription)
-        }
-    }
-
-    func saveCookieFromQR(_ cookie: String) {
-        do {
-            try credentialStore.save(cookie)
-            cachedObscuredCookie = nil
             showingLogin = false
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
-            appendLog("夸克扫码登录成功，凭据已写入钥匙串")
-            refreshPreflight()
-            restartInfuseBridge()
+            appendLog(message)
+            await startInfuseBridge()
         } catch {
             status = .failed(error.localizedDescription)
         }
     }
 
-    func forgetCredential() {
-        guard !hasActiveMount, !mountOperationInProgress else {
+    func forgetCredential() async {
+        guard canEditMountPath else {
             status = .failed("请先卸载 Quark")
             return
         }
+        isBusy = true
+        defer { isBusy = false }
         do {
-            stopInfuseBridge()
+            guard await stopInfuseBridge() else { return }
             try credentialStore.delete()
             cachedObscuredCookie = nil
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
             appendLog("已从钥匙串删除夸克登录信息")
-            refreshPreflight()
+            await refreshPreflight()
         } catch {
             status = .failed(error.localizedDescription)
         }
     }
 
-    func mount() {
-        guard !mountOperationInProgress, !hasActiveMount else { return }
-        refreshPreflight()
+    func mount() async {
+        guard !mountOperationInProgress, !hasActiveMount, !isBusy, !isChecking else { return }
+        isBusy = true
+        defer { isBusy = false }
+        await refreshPreflight()
         if hasActiveMount { return }
         let presence = mountPresence(at: settings.mountPath)
         guard presence == .none else {
@@ -265,12 +352,11 @@ final class AppModel: ObservableObject {
         }
 
         do {
+            try prepareMountDirectory()
             let mountSettings = settings
             let mountPath = mountSettings.mountPath
             let engine = URL(fileURLWithPath: enginePath)
-            if !FileManager.default.fileExists(atPath: paths.runtimeConfig.path) {
-                try prepareRuntimeConfig(engine: engine)
-            }
+            try await prepareRuntimeConfig(engine: engine)
             let plan = MountPlanBuilder.make(settings: mountSettings, paths: paths, command: command)
             let process = Process()
             let stdout = Pipe()
@@ -316,7 +402,7 @@ final class AppModel: ObservableObject {
     }
 
     func unmount() {
-        guard status != .unmounting else { return }
+        guard status != .unmounting, !isBusy else { return }
         let processID = engineProcess?.processIdentifier ?? 0
         let mountPath = activeMountPath ?? settings.mountPath
         let presence = mountPresence(at: mountPath)
@@ -376,25 +462,28 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func clearCache() {
+    func clearCache() async {
         guard canClearCache else {
             status = .failed("请先卸载，再清理磁盘缓存")
             return
         }
-        let restartBridge = infuseBridgeRunning
-        if restartBridge { stopInfuseBridge() }
+        isBusy = true
+        defer { isBusy = false }
+        let restartBridge = infuseBridgeProcess?.isRunning == true
+        guard await stopInfuseBridge() else { return }
         do {
-            try SafeCacheManager(
+            let manager = SafeCacheManager(
                 cacheRoot: paths.cacheDirectory,
                 allowedParent: paths.supportDirectory
-            ).clear()
+            )
+            try await Task.detached { try manager.clear() }.value
             try paths.prepare()
             cacheBytes = 0
             appendLog("QuarkFS 磁盘缓存已清理")
         } catch {
             status = .failed(error.localizedDescription)
         }
-        if restartBridge { startInfuseBridge() }
+        if restartBridge { await startInfuseBridge() }
     }
 
     func refreshCacheUsage() {
@@ -416,30 +505,35 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.open(URL(string: "https://macfuse.github.io/")!)
     }
 
-    func restartInfuseBridge() {
-        stopInfuseBridge()
-        startInfuseBridge()
+    func restartInfuseBridge() async {
+        guard !isBusy, !isShuttingDown else { return }
+        isBusy = true
+        defer { isBusy = false }
+        guard await stopInfuseBridge() else { return }
+        await startInfuseBridge()
     }
 
-    func startInfuseBridge() {
-        guard infuseBridgeProcess?.isRunning != true else {
-            infuseBridgeRunning = true
-            return
-        }
+    private func startInfuseBridge() async {
+        guard infuseBridgeProcess?.isRunning != true else { return }
 
-        refreshPreflight()
+        await refreshPreflight()
         guard preflight.hasCredential,
               preflight.engine.isQuarkCapable,
               let enginePath = preflight.engine.path else {
             infuseBridgeRunning = false
+            infuseBridgeDetail = preflight.hasCredential ? "未找到可用引擎" : "请先登录夸克账号"
+            return
+        }
+
+        guard WebDAVHealth.isPortAvailable(settings.infusePort) else {
+            infuseBridgeDetail = "端口 \(settings.infusePort) 不可用或已被占用，请更换端口"
+            appendLog(infuseBridgeDetail)
             return
         }
 
         do {
             let engine = URL(fileURLWithPath: enginePath)
-            if !FileManager.default.fileExists(atPath: paths.runtimeConfig.path) {
-                try prepareRuntimeConfig(engine: engine)
-            }
+            try await prepareRuntimeConfig(engine: engine)
             let process = Process()
             process.executableURL = engine
             let bridgeSettings = settings
@@ -447,60 +541,88 @@ final class AppModel: ObservableObject {
 
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { [weak self] _ in
+            process.terminationHandler = { [weak self] terminated in
                 Task { @MainActor [weak self] in
-                    guard let self, self.infuseBridgeProcess === process else { return }
+                    guard let self, self.infuseBridgeProcess === terminated else { return }
                     self.infuseBridgeProcess = nil
                     self.infuseBridgeRunning = false
-                    self.appendLog("Infuse 本机连接已停止")
+                    self.infuseBridgeActive = false
+                    self.infuseBridgeSettings = nil
+                    self.infuseBridgeDetail = "连接已停止（代码 \(terminated.terminationStatus)），请重新启动并检查端口或登录状态"
+                    self.appendLog(self.infuseBridgeDetail)
                 }
             }
 
             try process.run()
             infuseBridgeProcess = process
+            infuseBridgeActive = true
             infuseBridgeSettings = bridgeSettings
-            Task {
-                try? await Task.sleep(for: .milliseconds(350))
-                guard self.infuseBridgeProcess === process else { return }
-                self.infuseBridgeRunning = process.isRunning
-                if process.isRunning {
-                    self.appendLog("Infuse 本机连接已就绪：127.0.0.1:8686")
-                } else {
-                    self.appendLog("Infuse 本机连接启动失败")
+            infuseBridgeDetail = "正在检查本机连接…"
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.connectionProxyDictionary = [:]
+            let session = URLSession(configuration: configuration)
+            defer { session.invalidateAndCancel() }
+            for _ in 0..<10 {
+                guard infuseBridgeProcess === process, process.isRunning else { return }
+                let health = await WebDAVHealth.check(
+                    url: URL(string: "http://127.0.0.1:\(bridgeSettings.infusePort)/")!, session: session
+                )
+                // Allow bind failures to surface before accepting a response
+                // from an unrelated service using the configured port.
+                try? await Task.sleep(for: .milliseconds(200))
+                guard infuseBridgeProcess === process, process.isRunning else { return }
+                if health == .ready {
+                    infuseBridgeRunning = true
+                    infuseBridgeDetail = "已就绪 · 127.0.0.1:\(bridgeSettings.infusePort)"
+                    appendLog("Infuse 本机连接已通过目录读取检查")
+                    return
+                }
+                if case .failed(let detail) = health {
+                    _ = await stopInfuseBridge()
+                    infuseBridgeDetail = detail
+                    appendLog(detail)
+                    return
                 }
             }
+            _ = await stopInfuseBridge()
+            infuseBridgeDetail = "启动超时，请检查 \(bridgeSettings.infusePort) 端口和夸克登录状态后重试"
+            appendLog(infuseBridgeDetail)
         } catch {
             infuseBridgeRunning = false
-            appendLog("Infuse 本机连接启动失败：\(error.localizedDescription)")
+            infuseBridgeDetail = "启动失败：\(error.localizedDescription)"
+            appendLog("Infuse 本机连接\(infuseBridgeDetail)")
         }
     }
 
-    private func stopInfuseBridge() {
+    private func stopInfuseBridge() async -> Bool {
         guard let process = infuseBridgeProcess else {
             infuseBridgeRunning = false
-            return
+            infuseBridgeActive = false
+            return true
+        }
+        infuseBridgeDetail = "正在停止本机连接…"
+        guard await ProcessRunner.stop(process) else {
+            infuseBridgeDetail = "无法停止本机连接，已保留缓存，请重试"
+            appendLog(infuseBridgeDetail)
+            return false
         }
         infuseBridgeProcess = nil
         infuseBridgeRunning = false
+        infuseBridgeActive = false
         infuseBridgeSettings = nil
-        if process.isRunning {
-            process.terminate()
-            process.waitUntilExit()
-        }
+        infuseBridgeDetail = "尚未运行"
+        return true
     }
 
     private func prepareMountDirectory() throws {
-        let url = URL(fileURLWithPath: settings.mountPath, isDirectory: true).standardizedFileURL
-        guard url.path.hasPrefix(FileManager.default.homeDirectoryForCurrentUser.path + "/") else {
-            throw CocoaError(.fileWriteNoPermission, userInfo: [
-                NSLocalizedDescriptionKey: "当前版本只允许把挂载目录放在你的个人文件夹内"
-            ])
-        }
+        let url = try MountDirectory.validate(path: settings.mountPath, supportDirectory: paths.supportDirectory)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        settings.mountPath = url.path
     }
 
-    private func prepareRuntimeConfig(engine: URL) throws {
-        let obscured = try obscuredCookie(engine: engine)
+    private func prepareRuntimeConfig(engine: URL) async throws {
+        let obscured = try await obscuredCookie(engine: engine)
+        try paths.prepare()
         let config = "[quark]\ntype = quark\ncookie = \(obscured)\n"
         try config.write(to: paths.runtimeConfig, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
@@ -509,18 +631,20 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func obscuredCookie(engine: URL) throws -> String {
+    private func obscuredCookie(engine: URL) async throws -> String {
         if let cachedObscuredCookie {
             return cachedObscuredCookie
         }
         guard let cookie = try credentialStore.load(), !cookie.isEmpty else {
             throw QuarkLoginError.missingCookie
         }
-        let result = try ProcessRunner.run(
-            executable: engine,
-            arguments: ["obscure", "-"],
-            input: Data((cookie + "\n").utf8)
-        )
+        let result = try await Task.detached {
+            try ProcessRunner.run(
+                executable: engine,
+                arguments: ["obscure", "-"],
+                input: Data((cookie + "\n").utf8)
+            )
+        }.value
         guard result.status == 0 else {
             throw CocoaError(.executableLoad, userInfo: [
                 NSLocalizedDescriptionKey: result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -531,33 +655,50 @@ final class AppModel: ObservableObject {
         return obscured
     }
 
-    func shutdownNow() {
-        stopInfuseBridge()
+    func shutdownNow() async -> Bool {
+        guard !isBusy, !isShuttingDown else {
+            appendLog("操作正在进行，请完成后再退出")
+            return false
+        }
+        isShuttingDown = true
+        isBusy = true
+        defer { isBusy = false; isShuttingDown = false }
+        guard await stopInfuseBridge() else { return false }
         let mountPath = activeMountPath ?? settings.mountPath
         let presence = mountPresence(at: mountPath)
         var unmounted = presence != .quark
 
         if presence == .quark,
-           let result = try? ProcessRunner.run(
-                executable: URL(fileURLWithPath: "/sbin/umount"),
-                arguments: [mountPath]
-           ) {
+           let result = await Task.detached(operation: {
+               try? ProcessRunner.run(
+                   executable: URL(fileURLWithPath: "/sbin/umount"),
+                   arguments: [mountPath], timeout: 8
+               )
+           }).value {
             unmounted = result.status == 0
             if !unmounted {
+                status = .failed("磁盘正在使用，退出已取消；请关闭播放器后重试")
                 appendLog("退出时卸载失败，已保留文件系统引擎")
             }
         }
 
-        if let process = engineProcess, process.isRunning, unmounted {
-            process.terminate()
+        guard unmounted else { return false }
+
+        if let process = engineProcess, process.isRunning {
+            guard await ProcessRunner.stop(process) else { return false }
         }
         if unmounted {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
         }
+        if settings.profile == .zeroResidual || settings.autoCleanup {
+            let manager = SafeCacheManager(cacheRoot: paths.cacheDirectory, allowedParent: paths.supportDirectory)
+            try? await Task.detached { try manager.clear() }.value
+        }
+        return true
     }
 
     private func confirmMount(process: Process, path: String, openFinder: Bool) async {
-        for _ in 0..<20 {
+        for _ in 0..<120 {
             try? await Task.sleep(for: .milliseconds(250))
             guard engineProcess === process, process.isRunning, status == .mounting else { return }
             switch mountPresence(at: path) {
@@ -582,9 +723,9 @@ final class AppModel: ObservableObject {
         }
 
         guard engineProcess === process, process.isRunning, status == .mounting else { return }
-        status = .failed("挂载未在 5 秒内完成，请查看运行记录")
+        status = .failed("挂载未在 30 秒内完成，请查看运行记录")
         appendLog("挂载超时，正在停止未完成的文件系统引擎")
-        process.terminate()
+        _ = await ProcessRunner.stop(process)
     }
 
     private func handleTermination(process: Process, status terminationStatus: Int32) {
@@ -600,7 +741,7 @@ final class AppModel: ObservableObject {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
         }
 
-        if settings.profile == .zeroResidual || settings.autoCleanup {
+        if !isMountActive(at: mountPath), settings.profile == .zeroResidual || settings.autoCleanup {
             try? SafeCacheManager(
                 cacheRoot: paths.mountCacheDirectory,
                 allowedParent: paths.supportDirectory

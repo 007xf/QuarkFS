@@ -51,7 +51,7 @@ public enum InfusePlanBuilder {
         var arguments = [
             "--config", paths.runtimeConfig.path,
             "serve", "webdav", "quark:",
-            "--addr", "127.0.0.1:8686",
+            "--addr", "127.0.0.1:\(settings.infusePort)",
             "--read-only",
             "--cache-dir", paths.infuseCacheDirectory.path,
             "--vfs-cache-mode", settings.profile.vfsCacheMode,

@@ -18,11 +18,12 @@ public struct SafeCacheManager: Sendable {
     }
 
     public func allocatedBytes() -> Int64 {
+        guard (try? validateRoot()) != nil else { return 0 }
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey]
         guard let enumerator = FileManager.default.enumerator(
             at: cacheRoot,
             includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles]
+            options: []
         ) else { return 0 }
 
         var total: Int64 = 0
@@ -36,9 +37,7 @@ public struct SafeCacheManager: Sendable {
     }
 
     public func clear() throws {
-        guard Self.isDescendant(cacheRoot, of: allowedParent), cacheRoot != allowedParent else {
-            throw SafeCacheError.unsafePath
-        }
+        try validateRoot()
 
         let manager = FileManager.default
         guard manager.fileExists(atPath: cacheRoot.path) else {
@@ -52,6 +51,22 @@ public struct SafeCacheManager: Sendable {
             options: []
         ) {
             try manager.removeItem(at: item)
+        }
+    }
+
+    public func validateRoot() throws {
+        guard Self.isDescendant(cacheRoot, of: allowedParent), cacheRoot != allowedParent else {
+            throw SafeCacheError.unsafePath
+        }
+        // A lexical prefix alone permits Cache (or one of its parents) to be
+        // a symlink into another folder. Never traverse such a link to delete.
+        var current = cacheRoot
+        while current.path != allowedParent.path {
+            guard current.path != "/" else { throw SafeCacheError.unsafePath }
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil {
+                throw SafeCacheError.unsafePath
+            }
+            current.deleteLastPathComponent()
         }
     }
 
