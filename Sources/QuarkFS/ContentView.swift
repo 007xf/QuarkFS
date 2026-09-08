@@ -5,6 +5,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @StateObject private var draft = ConnectionDraft()
+    @State private var showingComponents = false
 
     var body: some View {
         ScrollView {
@@ -14,7 +15,9 @@ struct ContentView: View {
                     warning(message)
                 }
                 connectionCard
-                setupCard
+                if model.preflight.needsSetup || showingComponents {
+                    setupCard
+                }
                 cacheCard
                 activityCard
             }
@@ -51,12 +54,21 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Label(model.status.title, systemImage: model.status.symbol)
-                .font(.headline)
-                .foregroundStyle(statusColor)
-                .padding(.horizontal, 13)
-                .padding(.vertical, 8)
-                .background(statusColor.opacity(0.12), in: Capsule())
+            VStack(alignment: .trailing, spacing: 8) {
+                Label(model.status.title, systemImage: model.status.symbol)
+                    .font(.headline)
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 8)
+                    .background(statusColor.opacity(0.12), in: Capsule())
+                if !model.preflight.needsSetup {
+                    Button(showingComponents ? "收起组件与账号" : "组件与账号") {
+                        showingComponents.toggle()
+                        if showingComponents { Task { await model.refreshPreflight() } }
+                    }
+                    .buttonStyle(.link)
+                }
+            }
         }
     }
 
@@ -166,8 +178,8 @@ struct ContentView: View {
             VStack(spacing: 12) {
                 checkRow(
                     title: "QuarkFS 引擎",
-                    detail: model.preflight.engine.version ?? model.preflight.engine.problem ?? "未找到",
-                    passed: model.preflight.engine.isQuarkCapable
+                    detail: engineDetail,
+                    passed: model.preflight.engine.isQuarkCapable && model.preflight.engine.mountCommand == "cmount"
                 )
                 Divider()
                 checkRow(
@@ -208,7 +220,12 @@ struct ContentView: View {
             }
             .padding(6)
         } label: {
-            Label("首次设置", systemImage: "checklist")
+            HStack {
+                Label(model.preflight.needsSetup ? "首次设置" : "组件与账号", systemImage: "checklist")
+                Spacer()
+                Button(model.isChecking ? "检查中…" : "重新检查") { Task { await model.refreshPreflight() } }
+                    .disabled(model.isChecking)
+            }
         }
     }
 
@@ -334,6 +351,13 @@ struct ContentView: View {
         if model.preflight.macFUSEReady { return "已安装，系统扩展已加载" }
         if model.preflight.macFUSEInstalled { return "已安装，但系统扩展尚未加载；请在隐私与安全性中允许后重启" }
         return "需要安装并在系统设置中允许"
+    }
+
+    private var engineDetail: String {
+        if model.preflight.engine.isQuarkCapable && model.preflight.engine.mountCommand != "cmount" {
+            return "当前引擎缺少本地磁盘挂载功能，请重新安装 QuarkFS"
+        }
+        return model.preflight.engine.version ?? model.preflight.engine.problem ?? "未找到"
     }
 }
 

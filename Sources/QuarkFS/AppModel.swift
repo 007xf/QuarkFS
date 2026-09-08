@@ -31,6 +31,7 @@ enum MountStatus: Equatable {
 }
 
 struct PreflightState: Sendable {
+    var hasCompletedCheck = false
     var engine = EngineInspection(
         path: nil,
         isQuarkCapable: false,
@@ -44,9 +45,13 @@ struct PreflightState: Sendable {
     var mountDirectoryReady = false
     var mountDirectoryProblem: String?
 
-    var ready: Bool {
-        engine.isQuarkCapable && engine.mountCommand == "cmount" && macFUSEReady && hasCredential && mountDirectoryReady
+    var setupReady: Bool {
+        engine.isQuarkCapable && engine.mountCommand == "cmount" && macFUSEReady && hasCredential
     }
+
+    var needsSetup: Bool { hasCompletedCheck && !setupReady }
+
+    var ready: Bool { setupReady && mountDirectoryReady }
 }
 
 @MainActor
@@ -221,6 +226,7 @@ final class AppModel: ObservableObject {
                     result.mountDirectoryProblem = error.localizedDescription
                 }
             }
+            result.hasCompletedCheck = true
             return result
         }.value
         guard revision == preflightRevision else { return }

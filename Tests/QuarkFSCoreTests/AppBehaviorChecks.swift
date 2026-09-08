@@ -17,6 +17,23 @@ private final class TestCredentials: CredentialStoring, @unchecked Sendable {
 @main
 struct AppBehaviorChecks {
     @MainActor static func main() async throws {
+        var setup = PreflightState()
+        try require(!setup.needsSetup, "unresolved initial checks do not flash the setup card")
+        setup.hasCompletedCheck = true
+        try require(setup.needsSetup, "completed checks show missing setup requirements")
+        setup.engine = EngineInspection(path: "fixture", isQuarkCapable: true, mountCommand: "cmount", version: nil, problem: nil)
+        setup.macFUSEReady = true
+        setup.hasCredential = true
+        try require(!setup.needsSetup && !setup.ready, "healthy setup stays hidden even when the mount directory needs attention")
+        setup.hasCredential = false
+        try require(setup.needsSetup, "logout restores the setup card")
+        setup.hasCredential = true
+        setup.macFUSEReady = false
+        try require(setup.needsSetup, "a missing macFUSE extension restores the setup card")
+        setup.macFUSEReady = true
+        setup.engine = EngineInspection(path: "fixture", isQuarkCapable: true, mountCommand: "nfsmount", version: nil, problem: nil)
+        try require(setup.needsSetup, "an engine without cmount is not considered fully configured")
+
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(".build/AppBehavior-\(UUID().uuidString)")
         let paths = AppPaths(baseDirectory: root.appendingPathComponent("Support"))
@@ -36,6 +53,7 @@ struct AppBehaviorChecks {
             await model.bootstrap()
             try require(model.infuseBridgeRunning && !model.isBusy, "bootstrap checks an actual HTTP response")
             try require(credentials.loadCount == 1, "credentials read once")
+            try require(model.preflight.hasCompletedCheck, "the first live preflight resolves setup visibility")
             let oldPort = model.settings.infusePort
             let newPort = try freePort()
             await model.applyInfusePort(String(newPort))
@@ -120,6 +138,7 @@ struct AppBehaviorChecks {
 
             await model.forgetCredential()
             try require(!model.infuseBridgeActive && !model.preflight.hasCredential, "logout stops the bridge")
+            try require(model.preflight.needsSetup, "logout refreshes the visible setup requirement")
             try require(!FileManager.default.fileExists(atPath: paths.runtimeConfig.path), "logout removes runtime credentials")
             model.cookieInput = "replacement-test-only-cookie"
             await model.saveCookie()
