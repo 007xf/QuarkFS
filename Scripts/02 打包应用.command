@@ -6,6 +6,10 @@ OUTPUT_APP="$PROJECT_DIR/.build/QuarkFS.app"
 PACKAGING_STAGE=""
 ENGINE="$PROJECT_DIR/.build/engine/rclone"
 
+# Keep the final expanded build out of Spotlight too, not only staging folders.
+mkdir -p "$PROJECT_DIR/.build"
+touch "$PROJECT_DIR/.build/.metadata_never_index"
+
 if [[ ! -x "$ENGINE" ]]; then
   print "尚未构建文件系统引擎，请先运行“01 构建引擎.command”。"
   exit 1
