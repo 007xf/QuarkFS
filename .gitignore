@@ -1,5 +1,6 @@
 .DS_Store
 .build/
+01 升级备份/
 DerivedData/
 *.xcuserstate
 __pycache__/

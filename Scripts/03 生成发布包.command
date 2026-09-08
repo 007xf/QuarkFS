@@ -21,8 +21,11 @@ fi
 ARCHIVE_NAME="QuarkFS-macOS-arm64.zip"
 
 mkdir -p "$RELEASE_DIR"
-rm -f "$RELEASE_DIR/$ARCHIVE_NAME" "$RELEASE_DIR/$ARCHIVE_NAME.sha256"
-ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$RELEASE_DIR/$ARCHIVE_NAME"
+TEMP_ARCHIVE="$RELEASE_DIR/.$ARCHIVE_NAME.$$.partial"
+trap 'rm -f "$TEMP_ARCHIVE"' EXIT
+ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$TEMP_ARCHIVE"
+unzip -tq "$TEMP_ARCHIVE" >/dev/null
+mv -f "$TEMP_ARCHIVE" "$RELEASE_DIR/$ARCHIVE_NAME"
 (cd "$RELEASE_DIR" && shasum -a 256 "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256")
 
 print "发布包已生成：$RELEASE_DIR/$ARCHIVE_NAME"

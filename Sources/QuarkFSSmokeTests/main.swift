@@ -81,6 +81,23 @@ check(
     "不应把相似前缀目录误判为 Quark"
 )
 
+// Diagnose the current attempt only: historical EBUSY must not contaminate
+// an unrelated new failure, and a remote "busy" response is not a FUSE error.
+let diagnosticLog = paths.supportDirectory.appendingPathComponent("Diagnostic-test.log")
+let busyError = "mount_macfuse: mount failed /Users/test/Quark@/dev/macfuse1: Resource busy\n"
+try Data(busyError.utf8).write(to: diagnosticLog)
+let diagnostic = MountAttemptDiagnostics(logFile: diagnosticLog)
+check(!MountAttemptDiagnostics.isBusyFailure(output: diagnostic.text), "不能把历史挂载忙碌日志用于当前失败")
+let diagnosticWriter = try FileHandle(forWritingTo: diagnosticLog)
+try diagnosticWriter.seekToEnd()
+try diagnosticWriter.write(contentsOf: Data("CRITICAL: mountpoint is not empty\n".utf8))
+try diagnosticWriter.close()
+check(MountAttemptDiagnostics.failureMessage(status: 1, output: diagnostic.text).contains("包含文件"), "必须读取当前尝试新增的日志")
+diagnostic.append(Data(busyError.utf8))
+check(MountAttemptDiagnostics.isBusyFailure(output: diagnostic.text), "必须识别 stderr 中的 macFUSE EBUSY")
+check(!MountAttemptDiagnostics.isBusyFailure(output: "quark API: Resource busy"), "远端忙碌不能触发本机挂载重试")
+check(MountAttemptDiagnostics.failureMessage(status: 7, output: "").contains("代码 7"), "未知错误必须保留退出码")
+
 let spacedPath = temporaryRoot.appendingPathComponent("Quark Drive").path
 let escapedMountSample = "quark{example}: on \(spacedPath.replacingOccurrences(of: " ", with: "\\040")) (macfuse, read-only)"
 check(

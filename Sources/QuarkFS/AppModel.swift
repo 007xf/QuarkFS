@@ -74,6 +74,11 @@ final class AppModel: ObservableObject {
     private var infuseBridgeProcess: Process?
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
+    private var mountDiagnostics: MountAttemptDiagnostics?
+    private var mountNeedsRecovery = false
+    private var mayRetryBusyMount = true
+    private var mountRetryTask: Task<Void, Never>?
+    @Published private var mountStateKnown = true
     private var activeMountPath: String?
     private var infuseBridgeSettings: AppSettings?
     private var cachedObscuredCookie: String?
@@ -92,11 +97,11 @@ final class AppModel: ObservableObject {
     }
 
     var canEditMountPath: Bool {
-        !hasActiveMount && !mountOperationInProgress && !isBusy
+        mountStateKnown && !hasActiveMount && !mountOperationInProgress && !isBusy
     }
 
     var canClearCache: Bool {
-        !hasActiveMount && !mountOperationInProgress && !isBusy
+        mountStateKnown && !hasActiveMount && !mountOperationInProgress && !isBusy
     }
 
     init(
@@ -204,7 +209,9 @@ final class AppModel: ObservableObject {
             result.macFUSEReady = EngineLocator.isMacFUSEReady
             result.hasCredential = (try? store.contains()) == true
             let mounts = try? ProcessRunner.run(executable: URL(fileURLWithPath: "/sbin/mount"), arguments: [])
-            if MountDetector.presence(output: mounts?.standardOutput ?? "", path: mountPath) == .quark {
+            if mounts?.status != 0 {
+                result.mountDirectoryProblem = "无法读取系统挂载状态，请重新检查；挂载和缓存清理已暂停"
+            } else if MountDetector.presence(output: mounts?.standardOutput ?? "", path: mountPath) == .quark {
                 result.mountDirectoryReady = true
             } else {
                 do {
@@ -333,7 +340,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func mount() async {
+    func mount(retryBusyMount: Bool = true) async {
         guard !mountOperationInProgress, !hasActiveMount, !isBusy, !isChecking else { return }
         isBusy = true
         defer { isBusy = false }
@@ -361,26 +368,23 @@ final class AppModel: ObservableObject {
             let process = Process()
             let stdout = Pipe()
             let stderr = Pipe()
+            let diagnostics = MountAttemptDiagnostics(logFile: paths.logFile)
             process.executableURL = engine
             process.arguments = [plan.command] + plan.arguments
             process.standardOutput = stdout
             process.standardError = stderr
 
-            stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                let line = String(decoding: data, as: UTF8.self)
-                Task { @MainActor [weak self] in self?.appendEngineOutput(line) }
-            }
-            stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                let line = String(decoding: data, as: UTF8.self)
-                Task { @MainActor [weak self] in self?.appendEngineOutput(line) }
-            }
+            // Reserve both readers before starting the child: a very short
+            // failure may otherwise be classified before its stderr arrives.
+            let readers = DispatchGroup()
+            readers.enter()
+            readers.enter()
             process.terminationHandler = { [weak self] terminated in
-                Task { @MainActor [weak self] in
-                    self?.handleTermination(process: terminated, status: terminated.terminationStatus)
+                DispatchQueue.global().async {
+                    _ = readers.wait(timeout: .now() + 2)
+                    Task { @MainActor [weak self] in
+                        self?.handleTermination(process: terminated, status: terminated.terminationStatus)
+                    }
                 }
             }
 
@@ -389,8 +393,25 @@ final class AppModel: ObservableObject {
             activeMountPath = mountPath
             outputPipe = stdout
             errorPipe = stderr
+            mountDiagnostics = diagnostics
+            mountNeedsRecovery = false
+            mayRetryBusyMount = retryBusyMount
             status = .mounting
             appendLog("正在挂载 \(mountPath)")
+            for pipe in [stdout, stderr] {
+                DispatchQueue.global().async { [weak self] in
+                    defer { readers.leave() }
+                    let handle = pipe.fileHandleForReading
+                    while true {
+                        let data = handle.availableData
+                        guard !data.isEmpty else { break }
+                        diagnostics.append(data)
+                        let line = String(decoding: data, as: UTF8.self)
+                        Task { @MainActor [weak self] in self?.appendEngineOutput(line) }
+                    }
+                    try? handle.close()
+                }
+            }
 
             Task {
                 await self.confirmMount(process: process, path: mountPath, openFinder: mountSettings.openFinderAfterMount)
@@ -403,61 +424,74 @@ final class AppModel: ObservableObject {
 
     func unmount() {
         guard status != .unmounting, !isBusy else { return }
-        let processID = engineProcess?.processIdentifier ?? 0
+        mountRetryTask?.cancel()
+        mountRetryTask = nil
+        let process = engineProcess
         let mountPath = activeMountPath ?? settings.mountPath
         let presence = mountPresence(at: mountPath)
+        guard presence != .unknown else {
+            mountStateKnown = false
+            status = .failed("无法读取系统挂载状态，已保留文件系统引擎，请重新检查")
+            return
+        }
         guard presence != .conflict else {
             hasActiveMount = false
             status = .failed("挂载位置被其他磁盘占用，QuarkFS 不会卸载它")
             appendLog("拒绝卸载：挂载位置不是 Quark macFUSE 磁盘")
             return
         }
-        guard processID != 0 || presence == .quark else {
+        guard process != nil || presence == .quark else {
             activeMountPath = nil
             hasActiveMount = false
+            mountNeedsRecovery = false
             status = .notMounted
             return
         }
         status = .unmounting
+        isBusy = true
         appendLog("正在卸载 Quark")
 
-        if presence == .none {
-            if let process = engineProcess,
-               process.processIdentifier == processID,
-               process.isRunning {
-                process.terminate()
-            }
-            return
-        }
-
-        Task { @MainActor [weak self, mountPath, processID] in
-            let result = await Task.detached {
-                try? ProcessRunner.run(
-                    executable: URL(fileURLWithPath: "/sbin/umount"),
-                    arguments: [mountPath]
-                )
-            }.value
+        Task { @MainActor [weak self, mountPath, process, presence] in
             guard let self else { return }
-            guard let result else {
-                self.status = .failed("无法运行系统卸载工具")
-                self.appendLog("卸载失败：无法运行 /sbin/umount")
-                return
+            defer { self.isBusy = false }
+            if presence == .quark {
+                let result = await Task.detached {
+                    try? ProcessRunner.run(
+                        executable: URL(fileURLWithPath: "/sbin/umount"),
+                        arguments: [mountPath], timeout: 8
+                    )
+                }.value
+                // An exit code alone does not establish that the mount is gone.
+                let remaining = self.mountPresence(at: mountPath)
+                guard remaining == .none else {
+                    self.hasActiveMount = remaining == .quark
+                    self.mountStateKnown = remaining != .unknown
+                    let detail = result?.standardError.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    self.status = .failed(remaining == .unknown
+                        ? "无法确认卸载结果，已保留文件系统引擎，请重新检查"
+                        : "卸载未完成，请关闭正在使用磁盘的窗口或播放器后重试")
+                    self.appendLog(detail.isEmpty ? "卸载未完成，已保留文件系统引擎" : "卸载未完成：\(detail)")
+                    return
+                }
             }
-            guard result.status == 0 else {
-                let detail = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
-                self.hasActiveMount = true
-                self.status = .failed(detail.isEmpty ? "卸载失败，磁盘可能正在使用" : "卸载失败：\(detail)")
-                self.appendLog(detail.isEmpty ? "卸载失败：磁盘可能正在使用" : "卸载失败：\(detail)")
-                return
+            if let process, process.isRunning {
+                guard await ProcessRunner.stop(process) else {
+                    self.status = .failed("文件系统引擎尚未停止，请稍后重试")
+                    return
+                }
             }
-            try? await Task.sleep(for: .milliseconds(400))
-            if let process = self.engineProcess,
-               process.processIdentifier == processID,
-               process.isRunning {
-                process.terminate()
+            let finalPresence = self.mountPresence(at: mountPath)
+            guard finalPresence == .none else {
+                self.mountStateKnown = finalPresence != .unknown
+                self.hasActiveMount = finalPresence == .quark
+                self.mountNeedsRecovery = finalPresence == .quark
+                self.status = .failed("引擎已停止，但挂载状态仍需处理；请重新检查后安全卸载")
+                return
             }
             self.activeMountPath = nil
             self.hasActiveMount = false
+            self.mountNeedsRecovery = false
+            self.status = .notMounted
             self.refreshMountStatus()
         }
     }
@@ -662,10 +696,16 @@ final class AppModel: ObservableObject {
         }
         isShuttingDown = true
         isBusy = true
+        mountRetryTask?.cancel()
+        mountRetryTask = nil
         defer { isBusy = false; isShuttingDown = false }
         guard await stopInfuseBridge() else { return false }
         let mountPath = activeMountPath ?? settings.mountPath
         let presence = mountPresence(at: mountPath)
+        guard presence != .unknown else {
+            status = .failed("无法确认系统挂载状态，退出已取消；请重新检查")
+            return false
+        }
         var unmounted = presence != .quark
 
         if presence == .quark,
@@ -675,7 +715,7 @@ final class AppModel: ObservableObject {
                    arguments: [mountPath], timeout: 8
                )
            }).value {
-            unmounted = result.status == 0
+            unmounted = result.status == 0 && mountPresence(at: mountPath) == .none
             if !unmounted {
                 status = .failed("磁盘正在使用，退出已取消；请关闭播放器后重试")
                 appendLog("退出时卸载失败，已保留文件系统引擎")
@@ -686,6 +726,16 @@ final class AppModel: ObservableObject {
 
         if let process = engineProcess, process.isRunning {
             guard await ProcessRunner.stop(process) else { return false }
+        }
+        // A mount can finish between the first presence check and stopping a
+        // starting engine. Do not exit or clear its cache on stale evidence.
+        let finalPresence = mountPresence(at: mountPath)
+        guard finalPresence == .none || finalPresence == .conflict else {
+            mountStateKnown = finalPresence != .unknown
+            hasActiveMount = finalPresence == .quark
+            mountNeedsRecovery = finalPresence == .quark
+            status = .failed("挂载状态仍需处理，退出已取消；请重新检查后安全卸载")
+            return false
         }
         if unmounted {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
@@ -702,6 +752,10 @@ final class AppModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(250))
             guard engineProcess === process, process.isRunning, status == .mounting else { return }
             switch mountPresence(at: path) {
+            case .unknown:
+                // A transient mount-table read failure must not be treated as
+                // success or trigger cleanup of a possibly active filesystem.
+                continue
             case .quark:
                 hasActiveMount = true
                 activeMountPath = path
@@ -723,6 +777,20 @@ final class AppModel: ObservableObject {
         }
 
         guard engineProcess === process, process.isRunning, status == .mounting else { return }
+        let presence = mountPresence(at: path)
+        if presence == .quark {
+            hasActiveMount = true
+            activeMountPath = path
+            status = .mounted
+            appendLog("Quark 已作为本地磁盘挂载")
+            if openFinder { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+            return
+        }
+        guard presence == .none else {
+            mountStateKnown = presence != .unknown
+            status = .failed("无法确认挂载是否完成，已保留文件系统引擎；请重新检查")
+            return
+        }
         status = .failed("挂载未在 30 秒内完成，请查看运行记录")
         appendLog("挂载超时，正在停止未完成的文件系统引擎")
         _ = await ProcessRunner.stop(process)
@@ -731,17 +799,20 @@ final class AppModel: ObservableObject {
     private func handleTermination(process: Process, status terminationStatus: Int32) {
         guard engineProcess === process else { return }
         let wasUnmounting = self.status == .unmounting
+        let failedDuringStartup = self.status == .mounting
         let mountPath = activeMountPath ?? settings.mountPath
-        outputPipe?.fileHandleForReading.readabilityHandler = nil
-        errorPipe?.fileHandleForReading.readabilityHandler = nil
+        let diagnosticOutput = mountDiagnostics?.text ?? ""
         outputPipe = nil
         errorPipe = nil
+        mountDiagnostics = nil
         engineProcess = nil
+        let presence = mountPresence(at: mountPath)
+        mountStateKnown = presence != .unknown
         if infuseBridgeProcess?.isRunning != true {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
         }
 
-        if !isMountActive(at: mountPath), settings.profile == .zeroResidual || settings.autoCleanup {
+        if presence == .none, settings.profile == .zeroResidual || settings.autoCleanup {
             try? SafeCacheManager(
                 cacheRoot: paths.mountCacheDirectory,
                 allowedParent: paths.supportDirectory
@@ -750,11 +821,41 @@ final class AppModel: ObservableObject {
         }
         refreshCacheUsage()
 
-        if isMountActive(at: mountPath) {
+        if presence == .none, failedDuringStartup, terminationStatus != 0,
+           mayRetryBusyMount, !isShuttingDown,
+           MountAttemptDiagnostics.isBusyFailure(output: diagnosticOutput) {
+            hasActiveMount = false
+            activeMountPath = nil
+            appendLog("macFUSE 暂时忙碌；已确认旧引擎退出且没有挂载，稍候自动重试一次")
+            mountRetryTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .milliseconds(900)) } catch { return }
+                guard let self, !Task.isCancelled else { return }
+                self.mountRetryTask = nil
+                guard !self.isShuttingDown, !self.isBusy, !self.isChecking,
+                      self.engineProcess == nil, self.settings.mountPath == mountPath,
+                      self.mountPresence(at: mountPath) == .none else {
+                    self.status = .failed("挂载资源仍需检查，自动重试已暂停；请重新检查后挂载")
+                    self.refreshMountStatus()
+                    return
+                }
+                self.status = .notMounted
+                await self.mount(retryBusyMount: false)
+            }
+            return
+        }
+
+        if presence == .quark {
             hasActiveMount = true
             activeMountPath = mountPath
-            self.status = .mounted
-            appendLog("检测到挂载点仍在使用，已保留“已挂载”状态")
+            mountNeedsRecovery = true
+            self.status = .failed("文件系统引擎已停止，但 Quark 挂载仍在；请先卸载后重新挂载")
+            appendLog("检测到残留 Quark 挂载，已保留缓存并等待安全卸载")
+        } else if presence == .unknown {
+            self.status = .failed("文件系统引擎已停止，无法确认挂载状态；已保留缓存，请重新检查")
+        } else if presence == .conflict {
+            hasActiveMount = false
+            activeMountPath = nil
+            self.status = .failed("挂载位置被其他磁盘占用，QuarkFS 不会卸载它")
         } else if wasUnmounting {
             hasActiveMount = false
             activeMountPath = nil
@@ -769,19 +870,26 @@ final class AppModel: ObservableObject {
         } else {
             hasActiveMount = false
             activeMountPath = nil
-            self.status = .failed("文件系统引擎已退出（代码 \(terminationStatus)）")
+            self.status = .failed(MountAttemptDiagnostics.failureMessage(status: terminationStatus, output: diagnosticOutput))
         }
+        if case .failed(let detail) = self.status { appendLog(detail) }
         appendLog("文件系统引擎已停止")
     }
 
     private func refreshMountStatus() {
         let mountPath = activeMountPath ?? settings.mountPath
-        switch mountPresence(at: mountPath) {
+        let presence = mountPresence(at: mountPath)
+        mountStateKnown = presence != .unknown
+        switch presence {
+        case .unknown:
+            status = .failed("无法读取系统挂载状态，请重新检查；挂载和缓存清理已暂停")
         case .quark:
             let newlyAdopted = !hasActiveMount
             hasActiveMount = true
             activeMountPath = mountPath
-            if status != .mounting && status != .unmounting {
+            if mountNeedsRecovery {
+                status = .failed("文件系统引擎已停止，但 Quark 挂载仍在；请先卸载后重新挂载")
+            } else if status != .mounting && status != .unmounting {
                 status = .mounted
             }
             if newlyAdopted {
@@ -795,6 +903,7 @@ final class AppModel: ObservableObject {
             }
         case .none:
             hasActiveMount = false
+            mountNeedsRecovery = false
             if status == .mounted || status == .unmounting {
                 activeMountPath = nil
                 status = .notMounted
@@ -802,16 +911,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func isMountActive(at path: String) -> Bool {
-        mountPresence(at: path) == .quark
-    }
-
     private func mountPresence(at path: String) -> MountPresence {
         guard let result = try? ProcessRunner.run(
             executable: URL(fileURLWithPath: "/sbin/mount"),
             arguments: []
         ), result.status == 0 else {
-            return .none
+            return .unknown
         }
         return MountDetector.presence(
             output: result.standardOutput + result.standardError,

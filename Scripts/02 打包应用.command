@@ -2,7 +2,8 @@
 set -euo pipefail
 
 PROJECT_DIR="${0:A:h:h}"
-APP_DIR="$PROJECT_DIR/.build/QuarkFS.app"
+OUTPUT_APP="$PROJECT_DIR/.build/QuarkFS.app"
+PACKAGING_STAGE=""
 ENGINE="$PROJECT_DIR/.build/engine/rclone"
 
 if [[ ! -x "$ENGINE" ]]; then
@@ -40,6 +41,7 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$PROJECT_DIR/.build/swift-cache"
 SWIFT_FLAGS=(--disable-sandbox --build-system native --manifest-cache local --cache-path "$PROJECT_DIR/.build/spm-cache")
 swift run "${SWIFT_FLAGS[@]}" QuarkFSSmokeTests
 "$PROJECT_DIR/Scripts/04 检查应用行为.command"
+"$PROJECT_DIR/Scripts/06 检查单实例.command"
 
 build_swift() {
   local arch="$1"
@@ -58,7 +60,10 @@ done
 TEMP_MAIN="$PROJECT_DIR/.build/QuarkFS-arm64"
 cp "${MAIN_BINARIES[1]}" "$TEMP_MAIN"
 
-rm -rf "$APP_DIR"
+PACKAGING_STAGE="$(mktemp -d "$PROJECT_DIR/.build/packaging.XXXXXX")"
+trap '[[ -z "$PACKAGING_STAGE" ]] || rm -rf "$PACKAGING_STAGE"' EXIT
+touch "$PACKAGING_STAGE/.metadata_never_index"
+APP_DIR="$PACKAGING_STAGE/QuarkFS.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/Engine" "$APP_DIR/Contents/Resources/Documentation"
 cp "$TEMP_MAIN" "$APP_DIR/Contents/MacOS/QuarkFS"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
@@ -79,9 +84,16 @@ chmod 755 "$APP_DIR/Contents/MacOS/QuarkFS" "$APP_DIR/Contents/Resources/Engine/
 codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
+# Only replace the reproducible build artifact after signing verification. The
+# installed application is managed exclusively by the safe upgrade script.
+rm -rf "$OUTPUT_APP"
+mv "$APP_DIR" "$OUTPUT_APP"
+APP_DIR="$OUTPUT_APP"
+
 print "应用已生成：$APP_DIR"
 print "应用架构：$(lipo -archs "$APP_DIR/Contents/MacOS/QuarkFS")"
 print "引擎架构：$(lipo -archs "$APP_DIR/Contents/Resources/Engine/rclone")"
-if command -v open >/dev/null 2>&1; then
+print "安装或升级请运行“05 安全安装升级.command”，保持应用程序中只有一个 QuarkFS.app。"
+if [[ "${QUARKFS_REVEAL_BUILD:-0}" == 1 ]] && command -v open >/dev/null 2>&1; then
   open -R "$APP_DIR"
 fi

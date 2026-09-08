@@ -48,6 +48,8 @@ Infuse ───────────────────► 127.0.0.1:86
 2. `Scripts/02 打包应用.command`：运行核心冒烟测试，编译 Apple Silicon 版本，签名并生成 `.build/QuarkFS.app`；
 3. `Scripts/03 生成发布包.command`：生成Apple Silicon ZIP 和 SHA-256 校验文件。
 
+本机安装或升级请运行 `Scripts/05 安全安装升级.command`。脚本会检查应用已经退出，验证新包，并把旧版保存为经过解压比对的 ZIP 后替换 `/Applications/QuarkFS.app`。不要把旧版展开为 `QuarkFS 1.x.app` 放在文稿、下载或备份目录；这会被 Spotlight 收录为另一个启动入口。项目根目录 `01 升级备份` 中保留的 ZIP 可用于恢复，不随构建清理删除，也不提交到 Git；账号与设置仍使用原有位置。
+
 也可以在终端运行同名脚本。当前版本仅支持 Apple Silicon（M 系列芯片），不再构建 Intel 包。
 
 ## Infuse 配置
@@ -67,7 +69,9 @@ QuarkFS 运行并完成登录后，会自动启动只读 WebDAV。Infuse 的字�
 
 如果 Infuse 看不到目录，先回到 QuarkFS 确认“Infuse 本机连接”显示“已就绪”，再点“重新启动”；不要把 `~/Quark` 当作 Infuse 的网络地址。
 
-如果看到“文件系统引擎已退出（代码 1）”，先点“重新检查”。应用会识别旧版或手动启动留下的同一挂载点并接管状态，避免再次重复挂载；需要卸载时先停止播放器，再点“卸载 Quark”。
+1.1.1 起，挂载失败会结合本次引擎输出与新增日志说明原因。遇到 macFUSE “Resource busy / 错误 16”时，只有确认本次引擎已退出、目标位置没有挂载，才会等待片刻自动重试一次；仍失败时会保留明确提示。若引擎已退出但 Quark 挂载仍在，会显示需要处理，请关闭使用磁盘的窗口或播放器，再点“卸载 Quark”后重新挂载。卸载会等待系统确认挂载消失且本次引擎退出；无法读取系统挂载状态时，暂停挂载、清理缓存和退出。应用不会强制卸载其他磁盘，也不会删除挂载目录中的文件。
+
+1.1.1 还会在初始化连接之前阻止第二个 QuarkFS 实例，重复打开只激活已运行的应用。macFUSE 资源忙碌也可能来自系统暂时状态；若重新检查与重试后仍失败，可在关闭应用后重启 Mac。
 
 ## 缓存与安全边界
 
@@ -116,7 +120,9 @@ Scripts/03 生成发布包.command 生成 ZIP 与 SHA-256
 
 - `swift run --disable-sandbox --build-system native QuarkFSSmokeTests`：进程大输出/超时、缓存符号链接、挂载路径、旧设置迁移、WebDAV 响应与登录失败回归。
 - `Scripts/04 检查应用行为.command`：使用本机测试服务验证启动、停止、端口切换、清理缓存、退出登录和 App 退出；不使用真实账号。
+- `Scripts/06 检查单实例.command`：用独立进程验证同时启动保护、崩溃后的锁恢复、正常释放与符号链接拒绝。
 - 构建引擎后可运行 `python3 Tests/QuarkFSCoreTests/EngineIntegration.py .build/engine/rclone --mount`，使用临时文件检查真实 WebDAV 分段读取、只读保护及 macFUSE 挂载。
+- 已安装并允许 macFUSE 的 Mac 可额外运行 `QUARKFS_TEST_REAL_ENGINE_PATH="$PWD/.build/engine/rclone" QUARKFS_TEST_BUSY_FIRST=1 "Scripts/04 检查应用行为.command"`：通过 AppModel 使用真实引擎挂载临时本地文件，检查读取、卸载、重新挂载、重复点击互斥与一次性 EBUSY 重试，并连续验证六次快速失败的错误捕获；不读取真实夸克账号。测试仅挂载本次创建的临时目录，失败时先尝试正常退出。
 - GitHub CI 同时执行无账号回归检查并编译 Apple Silicon 版本。
 
 更新内容见 [05 更新记录.md](05%20更新记录.md)。

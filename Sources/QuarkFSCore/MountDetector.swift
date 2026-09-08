@@ -1,6 +1,7 @@
 import Foundation
 
 public enum MountPresence: Equatable, Sendable {
+    case unknown
     case none
     case quark
     case conflict

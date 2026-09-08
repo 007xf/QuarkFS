@@ -63,6 +63,51 @@ struct AppBehaviorChecks {
             await model.restartInfuseBridge()
             try require(model.infuseBridgeRunning, "stopped bridge can restart")
 
+            if ProcessInfo.processInfo.environment["QUARKFS_TEST_REAL_ENGINE_PATH"] != nil {
+                let source = paths.supportDirectory.appendingPathComponent("FixtureRemote")
+                try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+                let sentinel = Data("local-only-mount-regression".utf8)
+                try sentinel.write(to: source.appendingPathComponent("Sentinel.txt"))
+                await model.mount()
+                await model.mount() // Repeated clicks must not create another engine.
+                try require(await waitUntil { model.status == .mounted }, "real local mount becomes ready, including bounded EBUSY retry")
+                let mountedFile = URL(fileURLWithPath: model.settings.mountPath).appendingPathComponent("Sentinel.txt")
+                try require(try Data(contentsOf: mountedFile) == sentinel, "the mounted local source is readable")
+                let expectedAttempts = ProcessInfo.processInfo.environment["QUARKFS_TEST_BUSY_FIRST"] == "1" ? "2" : "1"
+                let counter = paths.supportDirectory.appendingPathComponent("mount-attempt-count")
+                try require(try String(contentsOf: counter) == expectedAttempts, "duplicate mount click is ignored and EBUSY retries only once")
+                model.unmount()
+                await model.mount() // Block remount until normal unmount and exit finish.
+                try require(await waitUntil { model.status == .notMounted && !model.isBusy }, "unmount waits for the actual mount and owned engine to stop")
+                try require(try String(contentsOf: counter) == expectedAttempts, "remount during unmount is blocked")
+                await model.mount()
+                try require(await waitUntil { model.status == .mounted }, "mount can restart after the previous engine has exited")
+                model.unmount()
+                try require(await waitUntil { model.status == .notMounted && !model.isBusy }, "second mount cleans up normally")
+                let busyPaths = AppPaths(baseDirectory: root.appendingPathComponent("BusySupport"))
+                try busyPaths.prepare()
+                try Data("busy-always".utf8).write(to: busyPaths.supportDirectory.appendingPathComponent("mount-failure-mode"))
+                let busySuite = suite + ".busy"
+                let busyDefaults = UserDefaults(suiteName: busySuite)!
+                defer { busyDefaults.removePersistentDomain(forName: busySuite) }
+                let busyModel = AppModel(credentialStore: TestCredentials(), defaults: busyDefaults, paths: busyPaths)
+                busyModel.settings.mountPath = root.appendingPathComponent("BusyMount").path
+                busyModel.settings.openFinderAfterMount = false
+                for cycle in 1...3 {
+                    await busyModel.mount()
+                    try require(await waitUntil {
+                        if case .failed(let detail) = busyModel.status {
+                            return detail.contains("macFUSE") && !busyModel.mountOperationInProgress
+                        }
+                        return false
+                    }, "immediate stderr EBUSY retains its precise diagnosis after exit")
+                    let attempts = try String(contentsOf: busyPaths.supportDirectory.appendingPathComponent("mount-attempt-count"))
+                    try require(attempts == String(cycle * 2), "a persistent EBUSY retries at most once per user request")
+                }
+                try require(await busyModel.shutdownNow(), "persistent failure leaves no mount or owned process")
+                print("PASS: real local macFUSE mount/read/unmount/remount, repeated-click exclusion and bounded EBUSY recovery across six immediate failures")
+            }
+
             let originalMount = model.settings.mountPath
             await model.applyMountPath(paths.supportDirectory.path)
             try require(model.settings.mountPath == originalMount, "application data cannot become the mount directory")
@@ -87,6 +132,14 @@ struct AppBehaviorChecks {
             _ = await model.shutdownNow()
             throw error
         }
+    }
+
+    @MainActor static func waitUntil(_ condition: () -> Bool) async -> Bool {
+        for _ in 0..<80 {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(125))
+        }
+        return condition()
     }
 
     static func require(_ condition: Bool, _ message: String) throws {

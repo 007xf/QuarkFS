@@ -21,6 +21,8 @@ jobs:
           zsh -n "Scripts/02 打包应用.command"
           zsh -n "Scripts/03 生成发布包.command"
           zsh -n "Scripts/04 检查应用行为.command"
+          zsh -n "Scripts/05 安全安装升级.command"
+          zsh -n "Scripts/06 检查单实例.command"
 
       - name: Run core smoke test
         run: swift run --disable-sandbox --build-system native --scratch-path .build/ci-smoke QuarkFSSmokeTests
@@ -31,6 +33,9 @@ jobs:
 
       - name: Build Apple Silicon app
         run: swift build --disable-sandbox --build-system native --scratch-path .build/ci-arm64 -c release --triple arm64-apple-macosx14.0
+
+      - name: Check single-instance contention and crash recovery
+        run: '"Scripts/06 检查单实例.command"'
 
       - name: Verify Apple Silicon app architecture
         run: |

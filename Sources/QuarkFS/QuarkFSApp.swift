@@ -1,10 +1,17 @@
 import AppKit
+import QuarkFSCore
 import SwiftUI
 
 @main
 struct QuarkFSApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var model = AppModel()
+    private let instanceLock: ApplicationInstanceLock
+    @StateObject private var model: AppModel
+
+    init() {
+        instanceLock = SingleInstanceApplication.acquireOrActivateExisting()
+        _model = StateObject(wrappedValue: AppModel())
+    }
 
     var body: some Scene {
         Window("QuarkFS", id: "main") {

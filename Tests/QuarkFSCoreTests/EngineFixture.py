@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Account-free engine fixture for application lifecycle regression checks."""
 import http.server
+import os
+from pathlib import Path
 import sys
 
 args = sys.argv[1:]
@@ -13,6 +15,21 @@ elif args == ["cmount", "--help"] or args == ["nfsmount", "--help"]:
 elif args == ["obscure", "-"]:
     sys.stdin.read()
     print("fixture-obscured-cookie")
+elif args[:2] == ["cmount", "quark:"] and os.environ.get("QUARKFS_TEST_REAL_ENGINE_PATH"):
+    # Opt-in local-only integration: forward the production mount options to
+    # the actual engine, using a temporary local source and test credentials.
+    support = Path(args[args.index("--config") + 1]).parent.parent
+    counter = support / "mount-attempt-count"
+    attempt = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(attempt))
+    always_busy = (support / "mount-failure-mode").exists()
+    if always_busy or (attempt == 1 and os.environ.get("QUARKFS_TEST_BUSY_FIRST") == "1"):
+        print("mount_macfuse: mount failed test@/dev/macfuse: Resource busy", file=sys.stderr, flush=True)
+        sys.exit(1)
+    args[1] = str(support / "FixtureRemote")
+    args += ["--devname", "quark:"]
+    engine = os.environ["QUARKFS_TEST_REAL_ENGINE_PATH"]
+    os.execv(engine, [engine] + args)
 elif "webdav" in args:
     host, port = args[args.index("--addr") + 1].split(":")
 
