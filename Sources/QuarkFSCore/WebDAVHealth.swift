@@ -40,13 +40,51 @@ public enum WebDAVHealth: Equatable, Sendable {
     }
 
     public static func evaluate(status: Int, data: Data) -> WebDAVHealth {
-        let body = String(decoding: data, as: UTF8.self).lowercased()
-        if status == 207, body.contains("multistatus"), body.contains("propstat"), body.contains("200 ok") {
-            return .ready
+        if status == 207 {
+            let parser = XMLParser(data: data)
+            let properties = WebDAVPropertiesParser()
+            parser.shouldProcessNamespaces = true
+            parser.shouldResolveExternalEntities = false
+            parser.delegate = properties
+            if parser.parse(), properties.hasSuccessfulPropstat { return .ready }
         }
         if status == 401 || status == 403 {
             return .failed("本机连接无权读取目录，请检查登录状态或端口是否被占用")
         }
         return .failed("本机目录检查失败（HTTP \(status)），请检查登录状态或连接端口")
+    }
+}
+
+/// A file name or error message can contain "200 OK". Only a complete DAV
+/// multistatus document with a successful property status establishes readiness.
+private final class WebDAVPropertiesParser: NSObject, XMLParserDelegate {
+    private var path: [String] = []
+    private var status = ""
+    private let statusPath = ["multistatus", "response", "propstat", "status"]
+    private(set) var hasSuccessfulPropstat = false
+
+    func parser(
+        _ parser: XMLParser, didStartElement elementName: String,
+        namespaceURI: String?, qualifiedName qName: String?, attributes: [String: String]
+    ) {
+        path.append(namespaceURI == "DAV:" ? elementName : "")
+        if path == statusPath { status = "" }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if path == statusPath { status += string }
+    }
+
+    func parser(
+        _ parser: XMLParser, didEndElement elementName: String,
+        namespaceURI: String?, qualifiedName qName: String?
+    ) {
+        if path == statusPath {
+            let parts = status.split(whereSeparator: \.isWhitespace)
+            if parts.count >= 2, parts[0].hasPrefix("HTTP/"), parts[1] == "200" {
+                hasSuccessfulPropstat = true
+            }
+        }
+        path.removeLast()
     }
 }
