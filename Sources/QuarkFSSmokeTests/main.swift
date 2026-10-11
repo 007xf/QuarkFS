@@ -158,6 +158,26 @@ for root in [linkedCache, linkedCache.appendingPathComponent("Child")] {
     } catch SafeCacheError.unsafePath {}
 }
 check(FileManager.default.fileExists(atPath: sentinel.path), "符号链接不能导致外部文件被删除")
+let externalCache = outside.appendingPathComponent("Cache")
+try FileManager.default.createDirectory(at: externalCache, withIntermediateDirectories: true)
+let externalCacheSentinel = externalCache.appendingPathComponent("keep.txt")
+try Data("keep external cache".utf8).write(to: externalCacheSentinel)
+let linkedSupport = temporaryRoot.appendingPathComponent("LinkedSupport")
+try AppPaths(baseDirectory: linkedSupport).prepare()
+let parentLinkedManager = SafeCacheManager(
+    cacheRoot: linkedSupport.appendingPathComponent("Cache"), allowedParent: linkedSupport
+)
+try parentLinkedManager.validateRoot()
+try FileManager.default.removeItem(at: linkedSupport)
+try FileManager.default.createSymbolicLink(at: linkedSupport, withDestinationURL: outside)
+do {
+    try parentLinkedManager.clear()
+    check(false, "应用数据父目录为链接时也必须拒绝清理")
+} catch SafeCacheError.unsafePath {}
+let preservedExternalCache = try Data(contentsOf: externalCacheSentinel)
+check(preservedExternalCache == Data("keep external cache".utf8),
+      "应用数据父目录的链接不能导致外部缓存文件被删除")
+check(parentLinkedManager.allocatedBytes() == 0, "缓存统计不得通过应用数据父目录的链接读取外部目录")
 let nestedLink = paths.cacheDirectory.appendingPathComponent("ExternalLink")
 try FileManager.default.createSymbolicLink(at: nestedLink, withDestinationURL: outside)
 try cacheManager.clear()
@@ -214,6 +234,18 @@ check(WebDAVHealth.evaluate(status: 207, data: validDAV) == .ready, "成功的 W
 check(WebDAVHealth.evaluate(status: 200, data: Data("<html>other server</html>".utf8)) != .ready, "其他 HTTP 服务不能被误报为 Infuse 已就绪")
 check(WebDAVHealth.evaluate(status: 207, data: Data("error".utf8)) != .ready, "无效的目录响应不能报就绪")
 check(WebDAVHealth.evaluate(status: 403, data: Data()) != .ready, "账号认证失败不能报就绪")
+let failedDAV = Data("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:propstat><D:prop><D:displayname>200 OK.mkv</D:displayname></D:prop><D:status>HTTP/1.1 403 Forbidden</D:status></D:propstat></D:response></D:multistatus>".utf8)
+check(WebDAVHealth.evaluate(status: 207, data: failedDAV) != .ready,
+      "文件名中的成功文本不能覆盖 WebDAV 属性读取失败")
+let truncatedDAV = validDAV.dropLast(10)
+check(WebDAVHealth.evaluate(status: 207, data: Data(truncatedDAV)) != .ready,
+      "未完整接收的 WebDAV XML 不能报就绪")
+let unrelatedXML = Data("<multistatus><response><propstat><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>".utf8)
+check(WebDAVHealth.evaluate(status: 207, data: unrelatedXML) != .ready,
+      "没有 DAV 命名空间的 XML 不能被误报为 WebDAV")
+let defaultNamespaceDAV = Data("<multistatus xmlns=\"DAV:\"><response><propstat><status>HTTP/1.1 200 Success</status></propstat></response></multistatus>".utf8)
+check(WebDAVHealth.evaluate(status: 207, data: defaultNamespaceDAV) == .ready,
+      "DAV 默认命名空间及合法的成功原因短语应通过检查")
 
 let loginConfiguration = URLSessionConfiguration.ephemeral
 loginConfiguration.protocolClasses = [LoginFailureProtocol.self]

@@ -59,13 +59,15 @@ public struct SafeCacheManager: Sendable {
             throw SafeCacheError.unsafePath
         }
         // A lexical prefix alone permits Cache (or one of its parents) to be
-        // a symlink into another folder. Never traverse such a link to delete.
+        // a symlink into another folder. Include allowedParent itself: it may
+        // have been replaced by a link after the app prepared its directories.
         var current = cacheRoot
-        while current.path != allowedParent.path {
-            guard current.path != "/" else { throw SafeCacheError.unsafePath }
+        while true {
             if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil {
                 throw SafeCacheError.unsafePath
             }
+            if current.path == allowedParent.path { break }
+            guard current.path != "/" else { throw SafeCacheError.unsafePath }
             current.deleteLastPathComponent()
         }
     }
