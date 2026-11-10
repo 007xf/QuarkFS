@@ -136,9 +136,9 @@ struct AppBehaviorChecks {
                         && configLines.contains("cookie = \(fixtureObscured("test-only-cookie"))"),
                         "runtime config names the quark remote and carries the obscured Keychain cookie")
             try require(try permissions(of: paths.runtimeConfig) == 0o600, "runtime config is readable only by the user")
-            try require(configLines.contains("user_agent = \(quarkClientUserAgent)"),
-                        "engine requests download links as the Quark PC client, not as the web page")
-            try require(configLines.count == 4, "runtime config contains only the remote type, cookie and user agent")
+            try require(!configLines.contains { $0.hasPrefix("user_agent") },
+                        "runtime config does not override the engine user agent")
+            try require(configLines.count == 3, "runtime config contains only the remote section, type and cookie")
             try require(model.preflight.hasCompletedCheck, "the first live preflight resolves setup visibility")
             let oldPort = model.settings.infusePort
             let newPort = try freePort()
@@ -516,10 +516,6 @@ struct AppBehaviorChecks {
     }
 
     static func originalSafeMount(_ root: URL) -> String { root.appendingPathComponent("ConflictMount").path }
-
-    /// The literal identity the engine must send; kept here so a change to
-    /// the production value is a deliberate, reviewed test change.
-    static let quarkClientUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
 
     /// Mirrors EngineFixture.py `obscure -`.
     static func fixtureObscured(_ cookie: String) -> String {

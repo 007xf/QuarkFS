@@ -13,10 +13,6 @@ import tempfile
 import time
 
 engine = str(pathlib.Path(sys.argv[1]).resolve())
-# Mirrors RuntimeConfiguration.quarkClientUserAgent and the runtime config format.
-QUARK_PC_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 "
-                       "Safari/537.36 Channel/pckk_other_ch")
 # Mirrors EngineLogOptions.arguments.
 LOG_OPTIONS = ["--log-level", "NOTICE", "--log-file-max-size", "10M", "--log-file-max-backups", "1"]
 USER, PASSWORD = "quarkfs", secrets.token_urlsafe(24)
@@ -48,17 +44,17 @@ def stop(process):
 
 with tempfile.TemporaryDirectory(prefix="QuarkFS-Engine-") as folder:
     root = pathlib.Path(folder)
-    # The engine must read the runtime config, including the user agent with
-    # its spaces, parentheses and semicolons, exactly as QuarkFS writes it.
+    # The engine must read the runtime config exactly as QuarkFS writes it,
+    # without any user_agent override.
     obscured = subprocess.run([engine, "obscure", "-"], input="test-only-cookie\n", text=True,
                               capture_output=True, check=True, env=OFFLINE).stdout.strip()
     config = root / "rclone.conf"
-    config.write_text(f"[quark]\ntype = quark\ncookie = {obscured}\nuser_agent = {QUARK_PC_USER_AGENT}\n")
+    config.write_text(f"[quark]\ntype = quark\ncookie = {obscured}\n")
     dumped = json.loads(subprocess.run([engine, "config", "dump", "--config", str(config)], text=True,
                                        capture_output=True, check=True, env=OFFLINE).stdout)
     assert dumped["quark"]["type"] == "quark", "quark remote"
-    assert dumped["quark"]["user_agent"] == QUARK_PC_USER_AGENT, "user agent parsed verbatim"
-    print("PASS: real engine reads the runtime config and the Quark PC client user agent verbatim", flush=True)
+    assert "user_agent" not in dumped["quark"], "runtime config must not set a user_agent"
+    print("PASS: real engine reads the runtime config without a user_agent override", flush=True)
 
     source = root / "Source"
     source.mkdir()

@@ -308,13 +308,13 @@ let roundtrip = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().e
 check(roundtrip == custom, "自定义连接设置应可持久化")
 check(AppSettings(infusePort: 0).infusePort == 8686, "无效端口不能传入引擎")
 
-// Quark refuses large files to the web page (code 23018); the engine must
-// identify as the PC client for the download link and the CDN transfer.
-let quarkPCUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
+// The runtime config must not carry a user_agent override, so the engine never
+// identifies as anything other than its own default client.
 let runtimeConfigText = try RuntimeConfiguration.text(obscuredCookie: "obscured-value")
 check(runtimeConfigText
-      == "[quark]\ntype = quark\ncookie = obscured-value\nuser_agent = \(quarkPCUserAgent)\n",
-      "运行配置必须包含 quark 远端、登录信息和夸克 PC 客户端标识")
+      == "[quark]\ntype = quark\ncookie = obscured-value\n",
+      "运行配置只能包含 quark 远端和登录信息，不得设置 user_agent")
+check(!runtimeConfigText.contains("user_agent"), "运行配置不得包含 user_agent")
 for invalid in ["", "line\nuser_agent = other", "with space"] {
     do {
         _ = try RuntimeConfiguration.text(obscuredCookie: invalid)
