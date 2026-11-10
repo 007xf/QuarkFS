@@ -27,11 +27,15 @@ public enum WebDAVHealth: Equatable, Sendable {
 
     public static func check(
         url: URL = URL(string: "http://127.0.0.1:8686/")!,
-        session: URLSession
+        session: URLSession,
+        authorization: String? = nil
     ) async -> WebDAVHealth {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 2)
         request.httpMethod = "PROPFIND"
         request.setValue("1", forHTTPHeaderField: "Depth")
+        if let authorization {
+            request.setValue(authorization, forHTTPHeaderField: "Authorization")
+        }
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { return .waiting }

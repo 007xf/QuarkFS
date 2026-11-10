@@ -23,6 +23,7 @@ jobs:
           zsh -n "Scripts/04 检查应用行为.command"
           zsh -n "Scripts/05 安全安装升级.command"
           zsh -n "Scripts/06 检查单实例.command"
+          zsh -n "Tests/QuarkFSCoreTests/ScriptChecks.zsh"
 
       - name: Run core smoke test
         run: swift run --disable-sandbox --build-system native --scratch-path .build/ci-smoke QuarkFSSmokeTests
@@ -36,6 +37,9 @@ jobs:
 
       - name: Check single-instance contention and crash recovery
         run: '"Scripts/06 检查单实例.command"'
+
+      - name: Check build, release and install scripts without installing
+        run: zsh "Tests/QuarkFSCoreTests/ScriptChecks.zsh"
 
       - name: Verify Apple Silicon app architecture
         run: |

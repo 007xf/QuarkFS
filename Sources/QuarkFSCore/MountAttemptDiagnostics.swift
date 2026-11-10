@@ -54,7 +54,10 @@ public final class MountAttemptDiagnostics: @unchecked Sendable {
         if lines.contains(where: { $0.contains("mount_macfuse") && ($0.contains("permission denied") || $0.contains("operation not permitted")) }) {
             return "macFUSE 未获准挂载，请检查系统设置中的文件系统扩展授权后重试"
         }
-        if lines.contains(where: { $0.contains("cookie") && ($0.contains("expired") || $0.contains("invalid")) }) {
+        if lines.contains(where: {
+            ($0.contains("cookie") && ($0.contains("expired") || $0.contains("invalid")))
+                || EngineIssue.classify(String($0)) == .loginExpired
+        }) {
             return "夸克登录信息已失效，请重新登录后挂载"
         }
         return "文件系统引擎已退出（代码 \(status)），请查看运行记录中的具体原因"

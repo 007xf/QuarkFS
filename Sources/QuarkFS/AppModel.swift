@@ -54,6 +54,18 @@ struct PreflightState: Sendable {
     var ready: Bool { setupReady && mountDirectoryReady }
 }
 
+/// The operating-system tools AppModel relies on. The behaviour checks replace
+/// them to exercise busy or unreadable mounts without macFUSE.
+struct SystemServices: Sendable {
+    var mountTable = URL(fileURLWithPath: "/sbin/mount")
+    var unmount = URL(fileURLWithPath: "/sbin/umount")
+    var macFUSEStatus: @Sendable () -> (installed: Bool, ready: Bool) = {
+        (EngineLocator.isMacFUSEInstalled, EngineLocator.isMacFUSEReady)
+    }
+
+    static let live = SystemServices()
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var settings: AppSettings
@@ -66,6 +78,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var isBusy = false
     @Published private(set) var isChecking = false
     @Published private(set) var infuseBridgeDetail = "尚未运行"
+    /// The latest read failure an engine logged, such as Quark refusing a
+    /// large file; nil until one occurs after an engine starts.
+    @Published private(set) var readIssue: String?
     @Published private(set) var shortcuts: ShortcutPreferences
     @Published private(set) var logs: [String] = []
     @Published var cookieInput = ""
@@ -74,15 +89,24 @@ final class AppModel: ObservableObject {
     let paths: AppPaths
 
     private let credentialStore: any CredentialStoring
+    private let system: SystemServices
     private let defaults: UserDefaults
     private var engineProcess: Process?
+    /// A mount engine that unmount or quit is stopping on purpose. Its
+    /// termination can be handled after that operation has already finished.
+    private var intentionallyStoppedEngine: Process?
     private var infuseBridgeProcess: Process?
+    /// The bridge being stopped on purpose. Its termination handler can run
+    /// before the stop returns and must not report the exit as a failure.
+    private var stoppingBridgeProcess: Process?
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
     private var mountDiagnostics: MountAttemptDiagnostics?
     private var mountNeedsRecovery = false
     private var mayRetryBusyMount = true
     private var mountRetryTask: Task<Void, Never>?
+    private var mountLogMonitor: Task<Void, Never>?
+    private var bridgeLogMonitor: Task<Void, Never>?
     @Published private var mountStateKnown = true
     private var activeMountPath: String?
     private var infuseBridgeSettings: AppSettings?
@@ -92,6 +116,11 @@ final class AppModel: ObservableObject {
     private var preflightRevision = 0
     private let settingsKey = "QuarkFS.settings.v1"
     private let shortcutsKey = "QuarkFS.shortcuts.v1"
+
+    /// The running WebDAV engine, for diagnostics and the behaviour checks.
+    var infuseBridgeProcessIdentifier: Int32? {
+        infuseBridgeProcess?.isRunning == true ? infuseBridgeProcess?.processIdentifier : nil
+    }
 
     var mountOperationInProgress: Bool {
         status == .mounting || status == .unmounting || (engineProcess?.isRunning == true && !hasActiveMount)
@@ -112,9 +141,11 @@ final class AppModel: ObservableObject {
     init(
         credentialStore: any CredentialStoring = KeychainCredentialStore(),
         defaults: UserDefaults = .standard,
-        paths: AppPaths = AppPaths()
+        paths: AppPaths = AppPaths(),
+        system: SystemServices = .live
     ) {
         self.credentialStore = credentialStore
+        self.system = system
         self.defaults = defaults
         self.paths = paths
         if let data = defaults.data(forKey: settingsKey),
@@ -180,6 +211,9 @@ final class AppModel: ObservableObject {
             status = .failed(error.localizedDescription)
             appendLog("初始化失败：\(error.localizedDescription)")
         }
+        // A crash or force quit skips the cleanup on quit. Each engine start
+        // writes the config again, so a leftover copy is never needed.
+        try? FileManager.default.removeItem(at: paths.runtimeConfig)
         await refreshPreflight()
         refreshCacheUsage()
         await restartInfuseBridge()
@@ -207,13 +241,15 @@ final class AppModel: ObservableObject {
         let mountPath = activeMountPath ?? settings.mountPath
         let support = paths.supportDirectory
         let store = credentialStore
+        let system = system
         let snapshot = await Task.detached {
             var result = PreflightState()
             result.engine = EngineLocator.inspect(EngineLocator.locate())
-            result.macFUSEInstalled = EngineLocator.isMacFUSEInstalled
-            result.macFUSEReady = EngineLocator.isMacFUSEReady
+            let macFUSE = system.macFUSEStatus()
+            result.macFUSEInstalled = macFUSE.installed
+            result.macFUSEReady = macFUSE.ready
             result.hasCredential = (try? store.contains()) == true
-            let mounts = try? ProcessRunner.run(executable: URL(fileURLWithPath: "/sbin/mount"), arguments: [])
+            let mounts = try? ProcessRunner.run(executable: system.mountTable, arguments: [])
             if mounts?.status != 0 {
                 result.mountDirectoryProblem = "无法读取系统挂载状态，请重新检查；挂载和缓存清理已暂停"
             } else if MountDetector.presence(output: mounts?.standardOutput ?? "", path: mountPath) == .quark {
@@ -269,15 +305,51 @@ final class AppModel: ObservableObject {
             infuseBridgeDetail = "端口应为 1024–65535 之间的整数"
             return
         }
+        guard port != settings.infusePort else { return }
+        // Check before stopping a working bridge or saving a port that would
+        // fail on every launch.
+        guard WebDAVHealth.isPortAvailable(port) else {
+            infuseBridgeDetail = "端口 \(port) 已被其他程序占用，仍使用端口 \(settings.infusePort)"
+            appendLog(infuseBridgeDetail)
+            return
+        }
+        let previousPort = settings.infusePort
+        let bridgeWasRunning = infuseBridgeRunning
         settings.infusePort = port
         await persistSettings()
+        // The probe binds 127.0.0.1 only and can miss a listener on all
+        // addresses; restore the working port if the restart failed.
+        if bridgeWasRunning, !infuseBridgeRunning {
+            let failure = infuseBridgeDetail
+            settings.infusePort = previousPort
+            await persistSettings()
+            await restartInfuseBridge()
+            appendLog("端口 \(port) 无法使用（\(failure)），已恢复端口 \(previousPort)")
+        }
+    }
+
+    /// The local WebDAV server requires these credentials; players such as
+    /// Infuse store them once, since they persist across launches.
+    func webDAVCredentials() throws -> WebDAVCredentials {
+        try paths.prepare()
+        return try WebDAVCredentials.loadOrCreate(at: paths.webDAVCredentials)
+    }
+
+    func infuseConnectionText() throws -> String {
+        let credentials = try webDAVCredentials()
+        return "WebDAV\n服务器：127.0.0.1\n端口：\(settings.infusePort)\n路径：/\nHTTPS：关闭\n"
+            + "用户名：\(credentials.username)\n密码：\(credentials.password)"
     }
 
     func copyInfuseConnection() {
-        let text = "WebDAV\n服务器：127.0.0.1\n端口：\(settings.infusePort)\n路径：/\nHTTPS：关闭\n用户名和密码：留空"
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        appendLog("Infuse 连接信息已复制")
+        do {
+            let text = try infuseConnectionText()
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            appendLog("Infuse 连接信息已复制（含用户名和密码）")
+        } catch {
+            appendLog("无法读取本机连接密码：\(error.localizedDescription)")
+        }
     }
 
     func openInfuse() {
@@ -305,16 +377,36 @@ final class AppModel: ObservableObject {
         await saveCredential(cookie, message: "登录信息已保存到 macOS 钥匙串")
     }
 
-    func saveCookieFromQR(_ cookie: String) async {
+    /// Returns false when the login could not be saved; the reason is shown
+    /// in the status so the login sheet can offer a new QR code.
+    @discardableResult
+    func saveCookieFromQR(_ cookie: String) async -> Bool {
         await saveCredential(cookie, message: "夸克扫码登录成功，凭据已写入钥匙串")
     }
 
-    private func saveCredential(_ cookie: String, message: String) async {
-        guard canEditMountPath else { return }
+    @discardableResult
+    private func saveCredential(_ cookie: String, message: String) async -> Bool {
+        // A scan can complete while another operation, such as cache cleanup,
+        // is still running. Wait for it rather than dropping a valid login.
+        let deadline = Date().addingTimeInterval(60)
+        while isBusy, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard canEditMountPath else {
+            let reason = !mountStateKnown ? "无法读取系统挂载状态，请点“重新检查”"
+                : (hasActiveMount || mountOperationInProgress) ? "请先卸载 Quark"
+                : "其他操作仍在进行"
+            status = .failed("登录信息尚未保存：\(reason)，然后重新扫码或保存 Cookie")
+            appendLog("登录信息尚未保存：\(reason)")
+            return false
+        }
         isBusy = true
         defer { isBusy = false }
         do {
-            guard await stopInfuseBridge() else { return }
+            guard await stopInfuseBridge() else {
+                status = .failed("登录信息尚未保存：无法停止本机连接，请重试")
+                return false
+            }
             try credentialStore.save(cookie)
             cachedObscuredCookie = nil
             cookieInput = ""
@@ -322,8 +414,10 @@ final class AppModel: ObservableObject {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
             appendLog(message)
             await startInfuseBridge()
+            return true
         } catch {
             status = .failed(error.localizedDescription)
+            return false
         }
     }
 
@@ -375,6 +469,7 @@ final class AppModel: ObservableObject {
             let stdout = Pipe()
             let stderr = Pipe()
             let diagnostics = MountAttemptDiagnostics(logFile: paths.logFile)
+            let logTail = EngineLogTail(url: paths.logFile)
             process.executableURL = engine
             process.arguments = [plan.command] + plan.arguments
             process.standardOutput = stdout
@@ -403,6 +498,11 @@ final class AppModel: ObservableObject {
             mountNeedsRecovery = false
             mayRetryBusyMount = retryBusyMount
             status = .mounting
+            readIssue = nil
+            mountLogMonitor?.cancel()
+            mountLogMonitor = monitorEngineLog(logTail, source: "磁盘挂载") { [weak self] in
+                self?.engineProcess === process
+            }
             appendLog("正在挂载 \(mountPath)")
             for pipe in [stdout, stderr] {
                 DispatchQueue.global().async { [weak self] in
@@ -457,13 +557,14 @@ final class AppModel: ObservableObject {
         isBusy = true
         appendLog("正在卸载 Quark")
 
-        Task { @MainActor [weak self, mountPath, process, presence] in
+        let unmountTool = system.unmount
+        Task { @MainActor [weak self, mountPath, process, presence, unmountTool] in
             guard let self else { return }
             defer { self.isBusy = false }
             if presence == .quark {
                 let result = await Task.detached {
                     try? ProcessRunner.run(
-                        executable: URL(fileURLWithPath: "/sbin/umount"),
+                        executable: unmountTool,
                         arguments: [mountPath], timeout: 8
                     )
                 }.value
@@ -480,6 +581,8 @@ final class AppModel: ObservableObject {
                     return
                 }
             }
+            // From here the engine's exit is the requested outcome.
+            if let process { self.intentionallyStoppedEngine = process }
             if let process, process.isRunning {
                 guard await ProcessRunner.stop(process) else {
                     self.status = .failed("文件系统引擎尚未停止，请稍后重试")
@@ -565,6 +668,13 @@ final class AppModel: ObservableObject {
             return
         }
 
+        // An engine left running by a crashed or force-quit QuarkFS still
+        // serves the drive and holds the port; stop it before checking.
+        if await EngineProcessRecord.stopOrphan(recordAt: paths.webDAVEngineRecord,
+                                                requiredArgument: paths.runtimeConfig.path) {
+            appendLog("已停止上次异常退出后遗留的 Infuse 连接引擎")
+        }
+
         guard WebDAVHealth.isPortAvailable(settings.infusePort) else {
             infuseBridgeDetail = "端口 \(settings.infusePort) 不可用或已被占用，请更换端口"
             appendLog(infuseBridgeDetail)
@@ -574,16 +684,22 @@ final class AppModel: ObservableObject {
         do {
             let engine = URL(fileURLWithPath: enginePath)
             try await prepareRuntimeConfig(engine: engine)
+            let credentials = try webDAVCredentials()
             let process = Process()
             process.executableURL = engine
             let bridgeSettings = settings
             process.arguments = InfusePlanBuilder.make(settings: bridgeSettings, paths: paths)
+            process.environment = ProcessInfo.processInfo.environment
+                .merging(credentials.engineEnvironment) { _, required in required }
+            let logTail = EngineLogTail(url: paths.webDAVLogFile)
 
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             process.terminationHandler = { [weak self] terminated in
                 Task { @MainActor [weak self] in
-                    guard let self, self.infuseBridgeProcess === terminated else { return }
+                    guard let self, self.infuseBridgeProcess === terminated,
+                          self.stoppingBridgeProcess !== terminated else { return }
+                    try? FileManager.default.removeItem(at: self.paths.webDAVEngineRecord)
                     self.infuseBridgeProcess = nil
                     self.infuseBridgeRunning = false
                     self.infuseBridgeActive = false
@@ -594,10 +710,16 @@ final class AppModel: ObservableObject {
             }
 
             try process.run()
+            try? EngineProcessRecord(runningProcess: process.processIdentifier)?.save(to: paths.webDAVEngineRecord)
             infuseBridgeProcess = process
             infuseBridgeActive = true
             infuseBridgeSettings = bridgeSettings
             infuseBridgeDetail = "正在检查本机连接…"
+            readIssue = nil
+            bridgeLogMonitor?.cancel()
+            bridgeLogMonitor = monitorEngineLog(logTail, source: "Infuse 连接") { [weak self] in
+                self?.infuseBridgeProcess === process
+            }
             let configuration = URLSessionConfiguration.ephemeral
             configuration.connectionProxyDictionary = [:]
             let session = URLSession(configuration: configuration)
@@ -605,7 +727,8 @@ final class AppModel: ObservableObject {
             for _ in 0..<10 {
                 guard infuseBridgeProcess === process, process.isRunning else { return }
                 let health = await WebDAVHealth.check(
-                    url: URL(string: "http://127.0.0.1:\(bridgeSettings.infusePort)/")!, session: session
+                    url: URL(string: "http://127.0.0.1:\(bridgeSettings.infusePort)/")!, session: session,
+                    authorization: credentials.authorization
                 )
                 // Allow bind failures to surface before accepting a response
                 // from an unrelated service using the configured port.
@@ -641,11 +764,15 @@ final class AppModel: ObservableObject {
             return true
         }
         infuseBridgeDetail = "正在停止本机连接…"
-        guard await ProcessRunner.stop(process) else {
+        stoppingBridgeProcess = process
+        let stopped = await ProcessRunner.stop(process)
+        stoppingBridgeProcess = nil
+        guard stopped else {
             infuseBridgeDetail = "无法停止本机连接，已保留缓存，请重试"
             appendLog(infuseBridgeDetail)
             return false
         }
+        try? FileManager.default.removeItem(at: paths.webDAVEngineRecord)
         infuseBridgeProcess = nil
         infuseBridgeRunning = false
         infuseBridgeActive = false
@@ -663,12 +790,7 @@ final class AppModel: ObservableObject {
     private func prepareRuntimeConfig(engine: URL) async throws {
         let obscured = try await obscuredCookie(engine: engine)
         try paths.prepare()
-        let config = "[quark]\ntype = quark\ncookie = \(obscured)\n"
-        try config.write(to: paths.runtimeConfig, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: paths.runtimeConfig.path
-        )
+        try RuntimeConfiguration.write(obscuredCookie: obscured, to: paths.runtimeConfig)
     }
 
     private func obscuredCookie(engine: URL) async throws -> String {
@@ -705,7 +827,9 @@ final class AppModel: ObservableObject {
         mountRetryTask?.cancel()
         mountRetryTask = nil
         defer { isBusy = false; isShuttingDown = false }
-        guard await stopInfuseBridge() else { return false }
+        // The WebDAV bridge is independent of the mount. Stop it only once the
+        // quit can no longer be cancelled by the mount, so a cancelled quit
+        // keeps Infuse playing.
         let mountPath = activeMountPath ?? settings.mountPath
         let presence = mountPresence(at: mountPath)
         guard presence != .unknown else {
@@ -713,11 +837,12 @@ final class AppModel: ObservableObject {
             return false
         }
         var unmounted = presence != .quark
+        let unmountTool = system.unmount
 
         if presence == .quark,
            let result = await Task.detached(operation: {
                try? ProcessRunner.run(
-                   executable: URL(fileURLWithPath: "/sbin/umount"),
+                   executable: unmountTool,
                    arguments: [mountPath], timeout: 8
                )
            }).value {
@@ -731,6 +856,7 @@ final class AppModel: ObservableObject {
         guard unmounted else { return false }
 
         if let process = engineProcess, process.isRunning {
+            intentionallyStoppedEngine = process
             guard await ProcessRunner.stop(process) else { return false }
         }
         // A mount can finish between the first presence check and stopping a
@@ -743,6 +869,7 @@ final class AppModel: ObservableObject {
             status = .failed("挂载状态仍需处理，退出已取消；请重新检查后安全卸载")
             return false
         }
+        guard await stopInfuseBridge() else { return false }
         if unmounted {
             try? FileManager.default.removeItem(at: paths.runtimeConfig)
         }
@@ -804,7 +931,9 @@ final class AppModel: ObservableObject {
 
     private func handleTermination(process: Process, status terminationStatus: Int32) {
         guard engineProcess === process else { return }
-        let wasUnmounting = self.status == .unmounting
+        let intendedStop = intentionallyStoppedEngine === process
+        if intendedStop { intentionallyStoppedEngine = nil }
+        let wasUnmounting = self.status == .unmounting || intendedStop
         let failedDuringStartup = self.status == .mounting
         let mountPath = activeMountPath ?? settings.mountPath
         let diagnosticOutput = mountDiagnostics?.text ?? ""
@@ -919,7 +1048,7 @@ final class AppModel: ObservableObject {
 
     private func mountPresence(at path: String) -> MountPresence {
         guard let result = try? ProcessRunner.run(
-            executable: URL(fileURLWithPath: "/sbin/mount"),
+            executable: system.mountTable,
             arguments: []
         ), result.status == 0 else {
             return .unknown
@@ -928,6 +1057,38 @@ final class AppModel: ObservableObject {
             output: result.standardOutput + result.standardError,
             path: path
         )
+    }
+
+    /// Engines write read failures only to their log files. Follow the log
+    /// while the engine is current and report each distinct issue once.
+    private func monitorEngineLog(
+        _ tail: EngineLogTail,
+        source: String,
+        isCurrent: @escaping @MainActor () -> Bool
+    ) -> Task<Void, Never> {
+        Task { @MainActor [weak self] in
+            var reported: Set<EngineIssue> = []
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
+                guard let self, isCurrent() else { return }
+                let lines = await Task.detached { tail.readNewLines() }.value
+                for issue in lines.compactMap(EngineIssue.classify) where reported.count < 20 {
+                    guard reported.insert(issue).inserted else { continue }
+                    // "Too many errors" follows the actual cause; keep showing the cause.
+                    let knownCause = reported.contains {
+                        if case .repeatedReadFailures = $0 { return false }
+                        return true
+                    }
+                    if case .repeatedReadFailures = issue, knownCause {} else {
+                        self.readIssue = issue.message
+                    }
+                    self.appendLog("\(source)：\(issue.message)")
+                    if issue == .loginExpired, source == "Infuse 连接", self.infuseBridgeRunning {
+                        self.infuseBridgeDetail = issue.message
+                    }
+                }
+            }
+        }
     }
 
     private func appendEngineOutput(_ text: String) {

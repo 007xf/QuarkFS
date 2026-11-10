@@ -349,6 +349,9 @@ private struct MenuBarContent: View {
         Divider()
 
         Text("Infuse · \(model.infuseBridgeDetail)")
+        if let issue = model.readIssue {
+            Text("最近问题 · \(issue)")
+        }
         Button(model.infuseBridgeActive ? "停止 Infuse 连接" : "启动 Infuse 连接") {
             Task {
                 if model.infuseBridgeActive { await model.disconnectInfuseBridge() }

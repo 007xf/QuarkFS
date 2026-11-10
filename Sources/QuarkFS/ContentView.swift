@@ -36,7 +36,7 @@ struct ContentView: View {
         .onChange(of: model.settings.mountPath) { _, path in draft.mountPathInput = path }
         .onChange(of: model.settings.infusePort) { _, port in draft.infusePortInput = String(port) }
         .sheet(isPresented: $model.showingLogin) {
-            QRLoginView { cookie in Task { await model.saveCookieFromQR(cookie) } }
+            QRLoginView { cookie in await model.saveCookieFromQR(cookie) }
         }
     }
 
@@ -159,7 +159,13 @@ struct ContentView: View {
                     Button("复制连接信息") { model.copyInfuseConnection() }
                     Button("打开 Infuse") { model.openInfuse() }
                 }
-                Text("Infuse 连接可独立使用，无需先挂载磁盘。更改端口后，请同步更新 Infuse 中的设置。")
+                if let issue = model.readIssue {
+                    Label(issue, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Text("Infuse 连接可独立使用，无需先挂载磁盘。连接需要用户名 \(WebDAVCredentials.defaultUsername) 和本机生成的密码，请点“复制连接信息”获取；更改端口后，请同步更新 Infuse 中的设置。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
