@@ -123,6 +123,14 @@ struct AppBehaviorChecks {
             try require(!(ProcessInfo.processInfo.environment["RCLONE_PASS"] ?? "").contains(bridgeCredentials.password),
                         "the WebDAV password is passed only to the engine, not to the app's own environment")
             try require(try permissions(of: paths.webDAVCredentials) == 0o600, "WebDAV credentials are readable only by the user")
+            let clipboard = NSPasteboard(name: NSPasteboard.Name("QuarkFS.Tests.\(UUID().uuidString)"))
+            defer { clipboard.releaseGlobally() }
+            model.copyInfuseConnection(to: clipboard)
+            let clipboardTypes = clipboard.types ?? []
+            try require(clipboard.string(forType: .string) == connectionText, "copy connection info puts the connection text on the pasteboard")
+            try require(clipboardTypes.contains(NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+                        && clipboardTypes.contains(NSPasteboard.PasteboardType("org.nspasteboard.TransientType")),
+                        "the copied WebDAV password is marked concealed and transient so clipboard managers skip it")
 
             // A player reads a large file that Quark refuses to the web client.
             _ = await get(port: model.settings.infusePort, path: "/Movies/QuarkFS-size-limit.mkv", authorization: bridgeAuthorization)
@@ -131,6 +139,9 @@ struct AppBehaviorChecks {
             try require(model.readIssue?.contains("23018") == true && model.infuseBridgeRunning,
                         "the refused read is shown in the window and menu while the bridge keeps serving")
             try require(model.logs.filter { $0.contains("23018") }.count == 1, "repeated engine errors for one file are reported once")
+            _ = await get(port: model.settings.infusePort, path: "/many-size-limits-then-expired", authorization: bridgeAuthorization)
+            try require(await waitUntil { model.readIssue?.contains("登录已失效") == true && model.infuseBridgeDetail.contains("登录已失效") },
+                        "an expired session is still reported after 20 other engine issues have been shown")
             let configLines = try runtimeConfigLines(paths)
             try require(configLines.first == "[quark]" && configLines.contains("type = quark")
                         && configLines.contains("cookie = \(fixtureObscured("test-only-cookie"))"),
@@ -284,6 +295,7 @@ struct AppBehaviorChecks {
             try await checkLoginDuringOtherWork(root: root, suite: suite)
             try await checkUnmountOutcomes(root: root, suite: suite)
             try await checkRelaunchAfterCrash(root: root, suite: suite)
+            try await checkRelaunchAfterCrash(root: root, suite: suite, loggedOut: true)
 
             await model.forgetCredential()
             try require(!model.infuseBridgeActive && !model.preflight.hasCredential, "logout stops the bridge")
@@ -472,10 +484,10 @@ struct AppBehaviorChecks {
 
     /// After a crash the engine keeps serving the port; the next launch must
     /// stop that leftover engine instead of reporting the port as occupied.
-    @MainActor static func checkRelaunchAfterCrash(root: URL, suite: String) async throws {
-        let support = root.appendingPathComponent("CrashSupport")
+    @MainActor static func checkRelaunchAfterCrash(root: URL, suite: String, loggedOut: Bool = false) async throws {
+        let support = root.appendingPathComponent(loggedOut ? "LoggedOutCrashSupport" : "CrashSupport")
         let port = try freePort()
-        let defaultsSuite = suite + ".crash"
+        let defaultsSuite = suite + (loggedOut ? ".crash-logged-out" : ".crash")
         defer { UserDefaults.standard.removePersistentDomain(forName: defaultsSuite) }
         let helper = Process()
         helper.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
@@ -490,11 +502,23 @@ struct AppBehaviorChecks {
         try require(helper.terminationReason == .uncaughtSignal && kill(leftover, 0) == 0,
                     "the crashed app left its WebDAV engine running")
 
-        let model = AppModel(credentialStore: TestCredentials(), defaults: UserDefaults(suiteName: defaultsSuite)!,
+        let relaunchCredentials = TestCredentials()
+        if loggedOut { try relaunchCredentials.delete() }
+        let model = AppModel(credentialStore: relaunchCredentials, defaults: UserDefaults(suiteName: defaultsSuite)!,
                              paths: AppPaths(baseDirectory: support))
         model.settings.mountPath = root.appendingPathComponent("CrashMount").path
         model.settings.infusePort = port
         await model.bootstrap()
+        if loggedOut {
+            // The leftover engine still holds the old cookie in memory; a
+            // relaunch without a login must stop it, not leave it serving.
+            let stopped = await waitUntil { kill(leftover, 0) != 0 }
+            let notStarted = !model.infuseBridgeRunning
+            _ = await model.shutdownNow()
+            try require(stopped, "a relaunch while logged out still stops the leftover engine of the crashed app")
+            try require(notStarted, "a relaunch while logged out does not start a new bridge")
+            return
+        }
         let recovered = model.infuseBridgeRunning && model.infuseBridgeProcessIdentifier != leftover
             && model.logs.contains { $0.contains("遗留") }
         let leftoverStopped = await waitUntil { kill(leftover, 0) != 0 }

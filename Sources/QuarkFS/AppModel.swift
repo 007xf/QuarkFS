@@ -341,11 +341,18 @@ final class AppModel: ObservableObject {
             + "用户名：\(credentials.username)\n密码：\(credentials.password)"
     }
 
-    func copyInfuseConnection() {
+    func copyInfuseConnection(to pasteboard: NSPasteboard = .general) {
         do {
             let text = try infuseConnectionText()
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
+            // The text contains the WebDAV password. Clipboard managers that
+            // follow the nspasteboard.org conventions skip concealed and
+            // transient items instead of recording and syncing them.
+            let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+            let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+            pasteboard.declareTypes([.string, concealed, transient], owner: nil)
+            pasteboard.setString(text, forType: .string)
+            pasteboard.setData(Data(), forType: concealed)
+            pasteboard.setData(Data(), forType: transient)
             appendLog("Infuse 连接信息已复制（含用户名和密码）")
         } catch {
             appendLog("无法读取本机连接密码：\(error.localizedDescription)")
@@ -585,6 +592,8 @@ final class AppModel: ObservableObject {
             if let process { self.intentionallyStoppedEngine = process }
             if let process, process.isRunning {
                 guard await ProcessRunner.stop(process) else {
+                    // The engine keeps running, so a later exit is not the requested one.
+                    self.intentionallyStoppedEngine = nil
                     self.status = .failed("文件系统引擎尚未停止，请稍后重试")
                     return
                 }
@@ -659,6 +668,14 @@ final class AppModel: ObservableObject {
     private func startInfuseBridge() async {
         guard infuseBridgeProcess?.isRunning != true else { return }
 
+        // An engine left running by a crashed or force-quit QuarkFS still
+        // serves the drive with the cookie it holds in memory and holds the
+        // port. Stop it first, even when logged out or without a usable engine.
+        if await EngineProcessRecord.stopOrphan(recordAt: paths.webDAVEngineRecord,
+                                                requiredArgument: paths.runtimeConfig.path) {
+            appendLog("已停止上次异常退出后遗留的 Infuse 连接引擎")
+        }
+
         await refreshPreflight()
         guard preflight.hasCredential,
               preflight.engine.isQuarkCapable,
@@ -666,13 +683,6 @@ final class AppModel: ObservableObject {
             infuseBridgeRunning = false
             infuseBridgeDetail = preflight.hasCredential ? "未找到可用引擎" : "请先登录夸克账号"
             return
-        }
-
-        // An engine left running by a crashed or force-quit QuarkFS still
-        // serves the drive and holds the port; stop it before checking.
-        if await EngineProcessRecord.stopOrphan(recordAt: paths.webDAVEngineRecord,
-                                                requiredArgument: paths.runtimeConfig.path) {
-            appendLog("已停止上次异常退出后遗留的 Infuse 连接引擎")
         }
 
         guard WebDAVHealth.isPortAvailable(settings.infusePort) else {
@@ -857,7 +867,10 @@ final class AppModel: ObservableObject {
 
         if let process = engineProcess, process.isRunning {
             intentionallyStoppedEngine = process
-            guard await ProcessRunner.stop(process) else { return false }
+            guard await ProcessRunner.stop(process) else {
+                intentionallyStoppedEngine = nil
+                return false
+            }
         }
         // A mount can finish between the first presence check and stopping a
         // starting engine. Do not exit or clear its cache on stale evidence.
@@ -1072,7 +1085,9 @@ final class AppModel: ObservableObject {
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
                 guard let self, isCurrent() else { return }
                 let lines = await Task.detached { tail.readNewLines() }.value
-                for issue in lines.compactMap(EngineIssue.classify) where reported.count < 20 {
+                // The cap bounds per-file reports; an expired login is reported once
+                // however many other issues came first.
+                for issue in lines.compactMap(EngineIssue.classify) where reported.count < 20 || issue == .loginExpired {
                     guard reported.insert(issue).inserted else { continue }
                     // "Too many errors" follows the actual cause; keep showing the cause.
                     let knownCause = reported.contains {

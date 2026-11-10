@@ -136,6 +136,17 @@ elif "webdav" in args:
                                   f'failed to write to cache file: quark HTTP error: http_status=400 status=400 '
                                   f'code=23018 message="download file size limit[test]"\n')
                     log.write(f"{stamp} ERROR : {name}: vfs cache: too many errors 11/10: last error: quark HTTP error\n")
+            # Many distinct files refused by Quark, then the session expiring:
+            # the expiry must not be lost behind the per-file reports.
+            if name == "many-size-limits-then-expired" and "--log-file" in args:
+                stamp = time.strftime("%Y/%m/%d %H:%M:%S")
+                with open(args[args.index("--log-file") + 1], "a") as log:
+                    for index in range(24):
+                        log.write(f'{stamp} ERROR : Movies/cap-{index}.mkv: vfs cache: failed to download: '
+                                  f'quark HTTP error: http_status=400 status=400 code=23018 '
+                                  f'message="download file size limit[test]"\n')
+                    log.write(f"{stamp} ERROR : Movies/cap-final.mkv: vfs cache: failed to download: "
+                              f"quark HTTP error: http_status=401 status=401\n")
             self.send_response(500)
             self.send_header("Content-Length", "0")
             self.end_headers()
