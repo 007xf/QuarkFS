@@ -13,7 +13,7 @@ final class QRLoginViewModel: ObservableObject {
     private var task: Task<Void, Never>?
     private var attempt = UUID()
 
-    func start(onSuccess: @escaping (String) -> Void) {
+    func start(onSuccess: @escaping (String) async -> Bool) {
         task?.cancel()
         attempt = UUID()
         let currentAttempt = attempt
@@ -42,8 +42,15 @@ final class QRLoginViewModel: ObservableObject {
                         statusText = "正在完成登录…"
                         let cookie = try await client.finish(serviceTicket: ticket)
                         try Task.checkCancellation()
+                        statusText = "正在保存登录信息…"
+                        let saved = await onSuccess(cookie)
                         isWorking = false
-                        onSuccess(cookie)
+                        if !saved {
+                            // The QR code is spent; offer a new one with the reason.
+                            scanURL = nil
+                            errorText = "登录信息未能保存，请按主窗口提示处理后重新生成二维码"
+                            statusText = "登录未完成"
+                        }
                         return
                     }
                     try await Task.sleep(for: .seconds(1))
@@ -71,7 +78,8 @@ final class QRLoginViewModel: ObservableObject {
 struct QRLoginView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model = QRLoginViewModel()
-    let onSuccess: (String) -> Void
+    /// Saves the cookie; returns false when it could not be saved.
+    let onSuccess: (String) async -> Bool
 
     var body: some View {
         VStack(spacing: 18) {

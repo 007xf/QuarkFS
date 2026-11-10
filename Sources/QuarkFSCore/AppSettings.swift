@@ -97,7 +97,10 @@ public struct AppPaths: Sendable {
     public let infuseCacheDirectory: URL
     public let runtimeDirectory: URL
     public let runtimeConfig: URL
+    public let webDAVEngineRecord: URL
     public let logFile: URL
+    public let webDAVLogFile: URL
+    public let webDAVCredentials: URL
 
     public init(baseDirectory: URL? = nil) {
         let base = baseDirectory ?? FileManager.default.urls(
@@ -111,7 +114,10 @@ public struct AppPaths: Sendable {
         infuseCacheDirectory = cacheDirectory.appendingPathComponent("Infuse", isDirectory: true)
         runtimeDirectory = base.appendingPathComponent("Runtime", isDirectory: true)
         runtimeConfig = runtimeDirectory.appendingPathComponent("rclone.conf")
+        webDAVEngineRecord = runtimeDirectory.appendingPathComponent("WebDAV-engine.json")
         logFile = base.appendingPathComponent("QuarkFS.log")
+        webDAVLogFile = base.appendingPathComponent("Infuse-WebDAV.log")
+        webDAVCredentials = base.appendingPathComponent("WebDAV-Credentials.json")
     }
 
     public func prepare() throws {

@@ -51,6 +51,55 @@ let infuseAgeIndex = balancedInfusePlan.firstIndex(of: "--vfs-cache-max-age")
 check(infuseSizeIndex != nil && balancedInfusePlan[infuseSizeIndex! + 1] == "5G", "Infuse 平衡模式应使用 5 GB 上限")
 check(infuseAgeIndex != nil && balancedInfusePlan[infuseAgeIndex! + 1] == "60s", "Infuse 平衡模式应在 60 秒后清理")
 
+func value(after flag: String, in arguments: [String]) -> String? {
+    guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { return nil }
+    return arguments[index + 1]
+}
+
+func enginePlans(_ settings: AppSettings) -> [(name: String, arguments: [String])] {
+    [("磁盘挂载", MountPlanBuilder.make(settings: settings, paths: paths).arguments),
+     ("Infuse", InfusePlanBuilder.make(settings: settings, paths: paths))]
+}
+
+// Every profile and cleanup choice must reach both engines as exact options:
+// a missing size limit or a wrong buffer silently changes disk and memory use.
+let expectedProfiles: [(profile: CacheProfile, mode: String, buffer: String, limit: String?)] = [
+    (.zeroResidual, "off", "256M", nil),
+    (.balanced, "full", "512M", "5G"),
+    (.performance, "full", "1G", "20G")
+]
+check(expectedProfiles.map(\.profile) == CacheProfile.allCases, "每个缓存策略都必须有参数检查")
+for expected in expectedProfiles {
+    for autoCleanup in [true, false] {
+        let settings = AppSettings(
+            mountPath: temporaryRoot.appendingPathComponent("Mount").path,
+            profile: expected.profile,
+            autoCleanup: autoCleanup,
+            cleanupDelaySeconds: 90
+        )
+        for plan in enginePlans(settings) {
+            let label = "\(plan.name) \(expected.profile.title) 自动清理=\(autoCleanup)"
+            let arguments = plan.arguments
+            check(value(after: "--vfs-cache-mode", in: arguments) == expected.mode, "\(label) 缓存模式应为 \(expected.mode)")
+            check(value(after: "--buffer-size", in: arguments) == expected.buffer, "\(label) 内存预读应为 \(expected.buffer)")
+            check(value(after: "--vfs-cache-max-size", in: arguments) == expected.limit, "\(label) 磁盘缓存上限不正确")
+            check(value(after: "--vfs-cache-poll-interval", in: arguments) == expected.limit.map { _ in "15s" },
+                  "\(label) 缓存清理检查间隔不正确")
+            let expectedAge = expected.limit.map { _ in autoCleanup ? "90s" : "24h" }
+            check(value(after: "--vfs-cache-max-age", in: arguments) == expectedAge, "\(label) 缓存保留时间不正确")
+            check(arguments.filter { $0 == "--vfs-cache-max-size" }.count <= 1, "\(label) 不能重复传入缓存上限")
+        }
+    }
+}
+
+// Engine logs live in Application Support across sessions. They must rotate
+// and must not record the cache cleaner's routine INFO line every 15 seconds.
+for plan in enginePlans(balancedSettings) {
+    check(value(after: "--log-level", in: plan.arguments) == "NOTICE", "\(plan.name) 引擎日志不应记录例行 INFO 信息")
+    check(value(after: "--log-file-max-size", in: plan.arguments) == "10M", "\(plan.name) 引擎日志必须限制单个文件大小")
+    check(value(after: "--log-file-max-backups", in: plan.arguments) == "1", "\(plan.name) 引擎日志只保留一个轮换备份")
+}
+
 let cacheFile = paths.cacheDirectory.appendingPathComponent("sample.bin")
 try Data(repeating: 0x41, count: 4096).write(to: cacheFile)
 let cacheManager = SafeCacheManager(cacheRoot: paths.cacheDirectory, allowedParent: paths.supportDirectory)
@@ -97,6 +146,36 @@ diagnostic.append(Data(busyError.utf8))
 check(MountAttemptDiagnostics.isBusyFailure(output: diagnostic.text), "必须识别 stderr 中的 macFUSE EBUSY")
 check(!MountAttemptDiagnostics.isBusyFailure(output: "quark API: Resource busy"), "远端忙碌不能触发本机挂载重试")
 check(MountAttemptDiagnostics.failureMessage(status: 7, output: "").contains("代码 7"), "未知错误必须保留退出码")
+// Quark rejects an expired session with HTTP 401 / code 31001 "require login";
+// the engine never prints the words "cookie expired".
+let expiredSession = "2026/11/09 10:00:00 CRITICAL: Failed to create file system: quark HTTP error: http_status=401 status=401 code=31001 message=\"require login [guest]\""
+check(MountAttemptDiagnostics.failureMessage(status: 1, output: expiredSession).contains("重新登录"),
+      "夸克登录失效必须提示重新登录")
+
+// Read failures that only reach the engine log must be recognised and named.
+let sizeLimitLine = "2026/09/02 22:39:19 ERROR : Movies/4K Film.mkv: vfs cache: failed to download: quark HTTP error: http_status=400 status=400 code=23018 message=\"download file size limit[1]\""
+check(EngineIssue.classify(sizeLimitLine) == .downloadSizeLimit(file: "4K Film.mkv"), "必须识别夸克下载大小限制（23018）及文件名")
+check(EngineIssue.classify(sizeLimitLine)?.message.contains("23018") == true, "大小限制提示必须包含错误代码")
+check(EngineIssue.classify(expiredSession) == .loginExpired, "必须识别夸克登录失效")
+check(EngineIssue.classify("2026/09/02 22:39:20 ERROR : Movies/clip.webm: vfs cache: too many errors 11/10: last error: EOF")
+      == .repeatedReadFailures(file: "clip.webm"), "必须识别连续读取失败")
+check(EngineIssue.classify("2026/09/02 22:39:21 ERROR : Failed to webdav with 232 errors: last error was: x") == nil,
+      "没有已知原因的汇总错误不能误报")
+check(EngineIssue.classify("2026/09/02 22:39:21 INFO  : vfs cache: cleaned: objects 1 (was 1)") == nil, "例行日志不能误报")
+
+let engineLog = paths.supportDirectory.appendingPathComponent("Engine-tail-test.log")
+try Data((sizeLimitLine + "\n").utf8).write(to: engineLog)
+let tail = EngineLogTail(url: engineLog)
+check(tail.readNewLines().isEmpty, "不能报告引擎启动前的旧日志")
+let tailWriter = try FileHandle(forWritingTo: engineLog)
+try tailWriter.seekToEnd()
+try tailWriter.write(contentsOf: Data("first new line\nincomplete".utf8))
+check(tail.readNewLines() == ["first new line"], "必须只返回新增的完整日志行")
+try tailWriter.write(contentsOf: Data(" line\n".utf8))
+try tailWriter.close()
+check(tail.readNewLines() == ["incomplete line"], "跨两次读取的日志行必须拼接完整")
+try Data("rotated\n".utf8).write(to: engineLog)
+check(tail.readNewLines() == ["rotated"], "日志轮换或截断后必须从头读取")
 
 let spacedPath = temporaryRoot.appendingPathComponent("Quark Drive").path
 let escapedMountSample = "quark{example}: on \(spacedPath.replacingOccurrences(of: " ", with: "\\040")) (macfuse, read-only)"
@@ -228,6 +307,98 @@ check(InfusePlanBuilder.make(settings: custom, paths: paths).contains("127.0.0.1
 let roundtrip = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(custom))
 check(roundtrip == custom, "自定义连接设置应可持久化")
 check(AppSettings(infusePort: 0).infusePort == 8686, "无效端口不能传入引擎")
+
+// The runtime config must not carry a user_agent override, so the engine never
+// identifies as anything other than its own default client.
+let runtimeConfigText = try RuntimeConfiguration.text(obscuredCookie: "obscured-value")
+check(runtimeConfigText
+      == "[quark]\ntype = quark\ncookie = obscured-value\n",
+      "运行配置只能包含 quark 远端和登录信息，不得设置 user_agent")
+check(!runtimeConfigText.contains("user_agent"), "运行配置不得包含 user_agent")
+for invalid in ["", "line\nuser_agent = other", "with space"] {
+    do {
+        _ = try RuntimeConfiguration.text(obscuredCookie: invalid)
+        check(false, "无效的登录信息不能写入运行配置")
+    } catch {}
+}
+// The local WebDAV server requires a random per-install password that
+// survives restarts, is readable only by the user, and never follows a link.
+let firstSecret = try WebDAVCredentials.generate()
+let secondSecret = try WebDAVCredentials.generate()
+check(firstSecret.password != secondSecret.password && firstSecret.password.count >= 32,
+      "本机连接密码必须随机生成且足够长")
+check(firstSecret.password.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" },
+      "本机连接密码只能使用可直接填写的字符")
+check(firstSecret.engineEnvironment == ["RCLONE_USER": "quarkfs", "RCLONE_PASS": firstSecret.password],
+      "本机连接凭据必须通过环境变量传给引擎")
+check(WebDAVCredentials(username: "user", password: "pass").authorization == "Basic dXNlcjpwYXNz",
+      "本机连接必须使用标准 Basic 认证")
+let savedSecret = try WebDAVCredentials.loadOrCreate(at: paths.webDAVCredentials)
+let reloadedSecret = try WebDAVCredentials.loadOrCreate(at: paths.webDAVCredentials)
+check(reloadedSecret == savedSecret, "本机连接密码在重启后必须保持不变")
+let secretMode = (try FileManager.default.attributesOfItem(atPath: paths.webDAVCredentials.path)[.posixPermissions] as? NSNumber)?.intValue
+check(secretMode == 0o600, "本机连接密码只能由当前用户读取")
+try Data("{\"username\":\"quarkfs\",\"password\":\"short\"}".utf8).write(to: paths.webDAVCredentials)
+let regeneratedSecret = try WebDAVCredentials.loadOrCreate(at: paths.webDAVCredentials)
+check(regeneratedSecret.password.count >= 32, "损坏或过短的本机连接密码必须重新生成")
+let secretTarget = outside.appendingPathComponent("secret-target.json")
+try Data("{\"username\":\"quarkfs\",\"password\":\"\(String(repeating: "a", count: 40))\"}".utf8).write(to: secretTarget)
+try FileManager.default.removeItem(at: paths.webDAVCredentials)
+try FileManager.default.createSymbolicLink(at: paths.webDAVCredentials, withDestinationURL: secretTarget)
+let relinked = try WebDAVCredentials.loadOrCreate(at: paths.webDAVCredentials)
+check(relinked.password != String(repeating: "a", count: 40), "本机连接密码不能通过符号链接读取")
+check((try? FileManager.default.destinationOfSymbolicLink(atPath: paths.webDAVCredentials.path)) == nil,
+      "符号链接必须被替换为普通文件")
+let secretTargetText = try String(contentsOf: secretTarget, encoding: .utf8)
+check(secretTargetText.contains(String(repeating: "a", count: 40)), "替换链接不能修改链接目标")
+
+// A leftover engine from a crashed app is stopped only when the record still
+// names the same process, launchd adopted it and its arguments are ours.
+func orphanedSleep(_ seconds: String) throws -> Int32 {
+    let result = try ProcessRunner.run(executable: URL(fileURLWithPath: "/bin/sh"),
+                                       arguments: ["-c", "/bin/sleep \(seconds) >/dev/null 2>&1 & echo $!"])
+    return Int32(result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
+}
+func waitForExit(_ pid: Int32) async -> Bool {
+    for _ in 0..<40 where kill(pid, 0) == 0 { try? await Task.sleep(for: .milliseconds(50)) }
+    return kill(pid, 0) != 0
+}
+let recordURL = paths.webDAVEngineRecord
+let orphan = try orphanedSleep("41")
+defer { kill(orphan, SIGKILL) }
+check(orphan > 0, "测试用遗留进程必须启动")
+try EngineProcessRecord(runningProcess: orphan)!.save(to: recordURL)
+let stoppedForeign = await EngineProcessRecord.stopOrphan(recordAt: recordURL, requiredArgument: "/other/rclone.conf")
+check(!stoppedForeign && kill(orphan, 0) == 0, "参数不属于本应用的进程不能被停止")
+check(!FileManager.default.fileExists(atPath: recordURL.path), "不匹配的进程记录必须删除")
+let staleRecord = EngineProcessRecord(runningProcess: orphan)!
+try Data(String(decoding: try JSONEncoder().encode(staleRecord), as: UTF8.self)
+    .replacingOccurrences(of: "\"startSeconds\":\(staleRecord.startSeconds)", with: "\"startSeconds\":\(staleRecord.startSeconds - 1)").utf8)
+    .write(to: recordURL)
+let stoppedReused = await EngineProcessRecord.stopOrphan(recordAt: recordURL, requiredArgument: "41")
+check(!stoppedReused && kill(orphan, 0) == 0, "进程号被复用时不能停止新进程")
+let ownChild = Process()
+ownChild.executableURL = URL(fileURLWithPath: "/bin/sleep")
+ownChild.arguments = ["42"]
+try ownChild.run()
+defer { ownChild.terminate() }
+try EngineProcessRecord(runningProcess: ownChild.processIdentifier)!.save(to: recordURL)
+let stoppedOwned = await EngineProcessRecord.stopOrphan(recordAt: recordURL, requiredArgument: "42")
+check(!stoppedOwned && ownChild.isRunning && FileManager.default.fileExists(atPath: recordURL.path),
+      "仍属于运行中应用的引擎不能被停止")
+try EngineProcessRecord(runningProcess: orphan)!.save(to: recordURL)
+let stoppedOrphan = await EngineProcessRecord.stopOrphan(recordAt: recordURL, requiredArgument: "41")
+let orphanExited = await waitForExit(orphan)
+check(stoppedOrphan && orphanExited, "本应用遗留的引擎必须被停止")
+check(!FileManager.default.fileExists(atPath: recordURL.path), "停止遗留引擎后必须删除记录")
+let stoppedMissing = await EngineProcessRecord.stopOrphan(recordAt: recordURL, requiredArgument: "41")
+check(!stoppedMissing, "没有记录时不能停止任何进程")
+
+let configURL = paths.runtimeConfig
+try RuntimeConfiguration.write(obscuredCookie: "obscured-value", to: configURL)
+let configMode = (try FileManager.default.attributesOfItem(atPath: configURL.path)[.posixPermissions] as? NSNumber)?.intValue
+check(configMode == 0o600, "运行配置只能由当前用户读取")
+try FileManager.default.removeItem(at: configURL)
 
 let validDAV = Data("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:propstat><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".utf8)
 check(WebDAVHealth.evaluate(status: 207, data: validDAV) == .ready, "成功的 WebDAV 目录响应应通过检查")

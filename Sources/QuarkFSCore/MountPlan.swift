@@ -10,6 +10,17 @@ public struct MountPlan: Equatable, Sendable {
     }
 }
 
+/// Engine logs persist in Application Support across sessions. NOTICE keeps
+/// errors and startup messages without the cache cleaner's routine INFO line,
+/// and rotation bounds each engine to about 20 MB.
+public enum EngineLogOptions {
+    public static let arguments = [
+        "--log-level", "NOTICE",
+        "--log-file-max-size", "10M",
+        "--log-file-max-backups", "1"
+    ]
+}
+
 public enum MountPlanBuilder {
     public static func make(
         settings: AppSettings,
@@ -29,9 +40,8 @@ public enum MountPlanBuilder {
             "--poll-interval", "0",
             "--vfs-read-chunk-size", "64M",
             "--vfs-read-chunk-size-limit", "512M",
-            "--log-file", paths.logFile.path,
-            "--log-level", "INFO"
-        ]
+            "--log-file", paths.logFile.path
+        ] + EngineLogOptions.arguments
 
         if let limit = settings.profile.diskCacheLimit {
             arguments.append(contentsOf: [
@@ -56,9 +66,8 @@ public enum InfusePlanBuilder {
             "--cache-dir", paths.infuseCacheDirectory.path,
             "--vfs-cache-mode", settings.profile.vfsCacheMode,
             "--buffer-size", settings.profile.bufferSize,
-            "--log-file", paths.supportDirectory.appendingPathComponent("Infuse-WebDAV.log").path,
-            "--log-level", "INFO"
-        ]
+            "--log-file", paths.webDAVLogFile.path
+        ] + EngineLogOptions.arguments
 
         if let limit = settings.profile.diskCacheLimit {
             arguments.append(contentsOf: [
