@@ -1,5 +1,7 @@
 # QuarkFS for macOS
 
+简体中文 | [English](README.en.md)
+
 QuarkFS 是一个非官方的 macOS 菜单栏工具，把夸克网盘以只读方式提供给 Finder、Infuse 和其他支持本地文件的播放器。它包含两条互相独立的读取路径：
 
 ```text
