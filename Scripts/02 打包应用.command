@@ -78,6 +78,7 @@ else
   lipo "$ENGINE" -thin arm64 -output "$APP_DIR/Contents/Resources/Engine/rclone"
 fi
 cp "$PROJECT_DIR/README.md" "$APP_DIR/Contents/Resources/Documentation/README.md"
+cp "$PROJECT_DIR/README.zh-CN.md" "$APP_DIR/Contents/Resources/Documentation/README.zh-CN.md"
 cp "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$APP_DIR/Contents/Resources/Documentation/THIRD_PARTY_NOTICES.md"
 cp "$PROJECT_DIR/05 更新记录.md" "$APP_DIR/Contents/Resources/Documentation/CHANGELOG.md"
 cp "$PROJECT_DIR/LICENSE" "$APP_DIR/Contents/Resources/Documentation/LICENSE"
