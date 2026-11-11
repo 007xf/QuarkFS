@@ -9,11 +9,35 @@ QuarkFS 的 SwiftUI 控制面板、缓存安全边界、钥匙串封装、Infuse
 - 实际构建来源：[zly2006/rclone@47a62e1b6081b5b65664e5e8f2fa7477eba9bd6f](https://github.com/zly2006/rclone/tree/47a62e1b6081b5b65664e5e8f2fa7477eba9bd6f)
 - 源码归档地址：`https://codeload.github.com/zly2006/rclone/tar.gz/47a62e1b6081b5b65664e5e8f2fa7477eba9bd6f`
 - 归档 SHA-256：`fce696c6ee13a26f38fa1b1a2ece9479eec771e765f868cd213151cd24e9d596`
-- 许可证：[GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html)
+- 许可证：[MIT License](https://github.com/zly2006/rclone/blob/47a62e1b6081b5b65664e5e8f2fa7477eba9bd6f/COPYING)（全文见下）
 
-QuarkFS 的构建脚本不会从漂移的分支拉取代码，而是下载上面的固定提交并校验 SHA-256。发布包中的 `Contents/Resources/Engine/rclone` 是独立的 GPLv3 可执行组件；它没有和 QuarkFS 的 Swift 代码链接成一个库，不能把 QuarkFS 的 MIT 许可理解成对 rclone 源码的再许可。
+QuarkFS 的构建脚本不会从漂移的分支拉取代码，而是下载上面的固定提交并校验 SHA-256。发布包中的 `Contents/Resources/Engine/rclone` 是独立的可执行组件，版权归 rclone 的作者所有，采用 rclone 自己的 MIT 许可证；它没有和 QuarkFS 的 Swift 代码链接成一个库，QuarkFS 的许可证不改变 rclone 的版权归属。
 
-要取得对应源码，可以直接打开固定提交页面或运行构建脚本重新下载。若重新分发包含 rclone 的二进制包，请同时保留本说明、GPLv3 文本和对应源码获取路径，并遵守 GPLv3 的通知、修改标注和再分发要求。本项目没有对 rclone 源码做本地修改。
+要取得对应源码，可以直接打开固定提交页面或运行构建脚本重新下载。若重新分发包含 rclone 的二进制包，请保留下面的 rclone 版权声明和许可声明。引擎还包含它依赖的 Go 模块，各自的许可证以锁定提交的 `go.mod` 所列模块为准。本项目没有对 rclone 源码做本地修改。
+
+rclone 的许可证原文（锁定提交的 `COPYING`）：
+
+```text
+Copyright (C) 2012 by Nick Craig-Wood http://www.craig-wood.com/nick/
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
 
 Quark 后端目前来自一个仍在公开讨论中的 Draft PR，使用夸克网页端接口和完整会话 Cookie。它不是夸克官方 SDK，也不代表夸克或 rclone 官方保证长期兼容。
 

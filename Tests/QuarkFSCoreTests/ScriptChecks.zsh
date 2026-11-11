@@ -214,13 +214,18 @@ check_installer_interrupt_recovery() {
 # Since macOS 15, Control-click > Open no longer bypasses Gatekeeper.
 check_gatekeeper_documentation() {
   local document
-  for document in README.md "01 项目说明.md" "02 安装与使用.md"; do
+  for document in README.zh-CN.md "01 项目说明.md" "02 安装与使用.md"; do
     if grep -q '仍要打开' "$PROJECT_DIR/$document" && grep -q 'macOS 15' "$PROJECT_DIR/$document"; then
       pass "$document explains the macOS 15+ Open Anyway step"
     else
       fail "$document only explains Control-click > Open, which macOS 15+ no longer allows"
     fi
   done
+  if grep -q 'Open Anyway' "$PROJECT_DIR/README.md" && grep -q 'macOS 15' "$PROJECT_DIR/README.md"; then
+    pass "README.md explains the macOS 15+ Open Anyway step"
+  else
+    fail "README.md only explains Control-click > Open, which macOS 15+ no longer allows"
+  fi
 }
 
 run_check() {

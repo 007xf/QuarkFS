@@ -1,84 +1,96 @@
 # QuarkFS for macOS
 
-QuarkFS 是一个非官方的 macOS 菜单栏工具，把夸克网盘以只读方式提供给 Finder、Infuse 和其他支持本地文件的播放器。它包含两条互相独立的读取路径：
+English | [简体中文](README.zh-CN.md)
+
+QuarkFS is an unofficial macOS menu-bar app that makes Quark Drive (夸克网盘) available, read-only, to Finder, Infuse and other players that open local files. It has two independent read paths:
 
 ```text
-Finder / 其他本地文件应用 ──► macFUSE 挂载 ──► QuarkFS 内置 rclone 引擎 ──► 夸克
-Infuse ───────────────────► 127.0.0.1:8686 只读 WebDAV ──► 同一个引擎 ──► 夸克
+Finder / other local-file apps ──► macFUSE mount ──► bundled rclone engine ──► Quark
+Infuse ─────────────────────────► read-only WebDAV on 127.0.0.1:8686 ──► same engine ──► Quark
 ```
 
-第二条路径解决了 Infuse 不接受 macFUSE 本地目录作为媒体来源的问题。WebDAV 只绑定到本机回环地址，不对局域网开放，并要求本机生成的用户名和密码，其他用户、沙盒应用和网页无法匿名读取；QuarkFS 退出时会关闭桥接进程，异常退出后再次打开会停止遗留的桥接进程。
+The second path exists because Infuse does not accept a macFUSE folder as a media source. The WebDAV server binds to the loopback address only, so it is not reachable from the local network. It requires a user name and a password generated on this Mac, so other users, sandboxed apps and web pages cannot read it anonymously. QuarkFS stops the bridge process when it quits, and stops a leftover bridge the next time it starts after a crash.
 
-## 现在能做什么
+> **Security notice:** versions 1.0.0 to 1.1.2 served the local WebDAV without authentication. Upgrade to 1.1.3 or later. See [GHSA-vv59-62m4-xmr6](https://github.com/007xf/QuarkFS/security/advisories/GHSA-vv59-62m4-xmr6).
 
-- 菜单栏常驻入口，使用 macOS 原生 `atom` 符号，避免图标白边和过度拥挤。
-- 只读 macFUSE 挂载，默认目录为 `~/Quark`。
-- 自动启动本机只读 WebDAV，默认 `http://127.0.0.1:8686`；支持独立启动/停止、自定义端口、复制连接信息及打开 Infuse。
-- 连接会先完成真实 WebDAV 目录检查，再显示“已就绪”；端口占用和登录失败会显示错误。播放时夸克拒绝下载（如代码 23018 下载大小限制）、登录失效或连续读取失败，会显示在连接区域、菜单栏和运行记录中。
-- 挂载目录支持选择器和显式应用，拒绝包含文件或覆盖应用数据的位置；输入过程不创建文件夹。
-- “首次设置”仅在组件或账号尚未就绪时显示；全部正常后自动隐藏，右上角“组件与账号”可随时展开查看或退出登录。
-- 扫码登录或粘贴 Cookie；登录信息只存储在 macOS 钥匙串，不写入仓库或普通明文配置。
-- “零残留 / 平衡 / 高性能”三档缓存策略，以及专用缓存清理。
-- 默认快捷键：`⌥⌘O` 显示窗口、`⌥⌘E` 挂载/卸载、`⌥⌘F` 打开 Finder、`⌥⌘R` 重新检查、`⌥⌘K` 清理缓存。
-- Bob 风格的快捷键录制页：点击组合框后直接按键，修饰键高亮；Esc 取消、Delete 清除、重复组合拒绝保存。
-- 应用和内置引擎均可生成 Apple Silicon（arm64）版本。
+## Features
 
-## 最快开始
+- Menu-bar app using the native macOS `atom` symbol.
+- Read-only macFUSE mount, at `~/Quark` by default.
+- Read-only local WebDAV that starts automatically, at `http://127.0.0.1:8686` by default. It can be started and stopped on its own, the port can be changed, and there are buttons to copy the connection details and to open Infuse.
+- A connection shows "Ready" only after a real WebDAV directory check passes. A busy port or a failed login is reported as an error. During playback, a download refused by Quark (for example code 23018, the download size limit), an expired login or repeated read failures are shown in the connection area, the menu bar and the activity log.
+- The mount folder is chosen with a picker and applied explicitly. Folders that contain files, or that overlap the app's own data, are refused. No folder is created while you type.
+- "First-time setup" is shown only while a component or the account is not ready, and hides once everything is fine. "Components & account" in the top-right corner opens it again, and is where you log out.
+- Log in by scanning a QR code or by pasting a Cookie. The login is stored only in the macOS Keychain, never in the repository or in a plain-text configuration file.
+- Three cache policies, "No residue", "Balanced" and "High performance", plus a dedicated cache cleaner.
+- Default shortcuts: `⌥⌘O` show window, `⌥⌘E` mount/unmount, `⌥⌘F` open in Finder, `⌥⌘R` re-check, `⌥⌘K` clear cache.
+- A shortcut recorder: click the field and press the keys. Esc cancels, Delete clears, and a combination already in use is refused.
+- The app and the bundled engine are built for Apple Silicon (arm64).
 
-### 直接使用发布包
+The app's interface is in Simplified Chinese. The Chinese labels are given in parentheses below where you need to find a button.
 
-1. 使用 Apple Silicon（M 系列芯片）Mac，系统为 macOS 14 或更高版本。
-2. 如果需要 Finder 本地磁盘挂载，安装 [macFUSE](https://macfuse.github.io/)，按系统提示允许扩展并重启；只使用 Infuse 本机连接可以跳过。
-3. 从 [GitHub Releases](https://github.com/007xf/QuarkFS/releases/latest) 下载 `QuarkFS-macOS-arm64.zip`，解压后把 `QuarkFS.app` 拖入“应用程序”。
-4. 当前包为本地 ad-hoc 签名，尚未使用 Apple Developer ID 公证，第一次打开会被 Gatekeeper 拦截。macOS 15 及以后：先双击打开一次，再到“系统设置 → 隐私与安全性”底部点击“仍要打开”并确认（右键“打开”在 macOS 15 起不再能放行）；macOS 14：在 Finder 中右键 App，选择“打开”。
-5. 打开 QuarkFS，扫码登录夸克。Infuse 连接会自动启动；使用 Finder 时，待运行条件通过后点击“挂载 Quark”。
-6. 在 Infuse 中添加 WebDAV：服务器 `127.0.0.1`，端口 `8686`，路径 `/`，用户名 `quarkfs`，密码在 QuarkFS 中点“复制连接信息”获取。也可以只使用 Finder 中的 `~/Quark`。
+## Quick start
 
-### 从源码构建
+### Use the release package
 
-源码构建需要：
+1. You need an Apple Silicon (M-series) Mac running macOS 14 or later.
+2. For the Finder mount, install [macFUSE](https://macfuse.github.io/), allow the system extension when macOS asks, and restart. Skip this step if you only use the Infuse connection.
+3. Download `QuarkFS-macOS-arm64.zip` from [GitHub Releases](https://github.com/007xf/QuarkFS/releases/latest), unzip it, and drag `QuarkFS.app` into Applications.
+4. The package is ad-hoc signed and not notarized with an Apple Developer ID, so Gatekeeper blocks the first launch. On macOS 15 and later: double-click the app once, then go to System Settings → Privacy & Security, click "Open Anyway" at the bottom and confirm (right-click → Open no longer works from macOS 15). On macOS 14: right-click the app in Finder and choose Open.
+5. Open QuarkFS and scan the QR code to log in to Quark. The Infuse connection starts automatically. For Finder, click "Mount Quark" (挂载 Quark) once the checks pass.
+6. In Infuse, add a WebDAV share: server `127.0.0.1`, port `8686`, path `/`, user name `quarkfs`, and the password from "Copy connection info" (复制连接信息) in QuarkFS. You can also just use `~/Quark` in Finder.
 
-- macOS 14 或更高版本；
-- Xcode Command Line Tools（提供 Swift 6 工具链）；
-- Go 1.22 或更高版本（只在构建内置引擎时需要）；
-- macFUSE（要使用 Finder/macFUSE 挂载时需要；没有它仍可构建和运行 WebDAV 读取路径）。
+### Build from source
 
-在 Finder 中按顺序双击：
+Requirements:
 
-1. `Scripts/01 构建引擎.command`：下载已锁定并校验的 rclone 源码，构建Apple Silicon 引擎；
-2. `Scripts/02 打包应用.command`：运行核心冒烟测试，编译 Apple Silicon 版本，签名并生成 `.build/QuarkFS.app`；
-3. `Scripts/03 生成发布包.command`：生成Apple Silicon ZIP 和 SHA-256 校验文件。
+- macOS 14 or later;
+- Xcode Command Line Tools (for the Swift 6 toolchain);
+- Go 1.22 or later (only to build the bundled engine);
+- macFUSE (only for the Finder mount; the WebDAV path builds and runs without it).
 
-本机安装或升级请运行 `Scripts/05 安全安装升级.command`。脚本会检查应用已经退出，验证新包，并把旧版保存为经过解压比对的 ZIP 后替换 `/Applications/QuarkFS.app`。不要把旧版展开为 `QuarkFS 1.x.app` 放在文稿、下载或备份目录；这会被 Spotlight 收录为另一个启动入口。项目根目录 `01 升级备份` 中保留的 ZIP 可用于恢复，不随构建清理删除，也不提交到 Git；账号与设置仍使用原有位置。
+Double-click these in Finder, in order, or run them in a terminal:
 
-也可以在终端运行同名脚本。当前版本仅支持 Apple Silicon（M 系列芯片），不再构建 Intel 包。
+1. `Scripts/01 构建引擎.command` downloads the pinned, checksum-verified rclone source and builds the Apple Silicon engine.
+2. `Scripts/02 打包应用.command` runs the core smoke tests, compiles the app, signs it and produces `.build/QuarkFS.app`.
+3. `Scripts/03 生成发布包.command` produces the ZIP and its SHA-256 file.
 
-## Infuse 配置
+To install or upgrade on your own Mac, run `Scripts/05 安全安装升级.command`. It checks that the app has quit, verifies the new package, saves the old version as a ZIP that is compared after extraction, and then replaces `/Applications/QuarkFS.app`. Do not keep an unpacked old copy such as `QuarkFS 1.x.app` in Documents, Downloads or a backup folder, because Spotlight will index it as a second launch target. The ZIPs in `01 升级备份` at the project root can be used to roll back. They survive build cleaning and are not committed to Git. Your account and settings stay where they were.
 
-QuarkFS 运行并完成登录后，会自动启动只读 WebDAV。Infuse 的字段填写如下：
+Only Apple Silicon is supported. Intel builds are no longer produced.
 
-| 字段 | 值 |
+## Infuse setup
+
+Once QuarkFS is running and logged in, the read-only WebDAV starts automatically. Fill in Infuse as follows:
+
+| Field | Value |
 | --- | --- |
-| 类型 | WebDAV |
-| 地址 | `127.0.0.1` |
-| 端口 | `8686` |
-| 路径 | `/` |
-| HTTPS | 关闭 |
-| 用户名 / 密码 | `quarkfs` / 点“复制连接信息”获取（每台 Mac 首次启动时随机生成，之后保持不变） |
+| Type | WebDAV |
+| Address | `127.0.0.1` |
+| Port | `8686` |
+| Path | `/` |
+| HTTPS | Off |
+| User name / password | `quarkfs` / from "Copy connection info" (generated at random on first launch on each Mac, and unchanged afterwards) |
 
-在连接区域可以点击“复制连接信息”和“打开 Infuse”。复制的内容包含用户名和密码；密码只保存在仅当前用户可读的 `~/Library/Application Support/com.holmes.QuarkFS/WebDAV-Credentials.json`，以环境变量传给引擎，不出现在进程参数中。端口被占用时，输入 1024–65535 之间的新端口并点击“应用端口”，随后同步修改 Infuse 的连接设置；已被其他程序占用的端口会直接拒绝，不会先停止正在使用的连接。点击“停止”仅关闭 Infuse 连接，不影响 Finder 挂载。重新打开窗口会保留本次运行中的停止状态；重新启动 App 后会自动连接。
+The connection area has "Copy connection info" and "Open Infuse" buttons. The copied text contains the user name and the password. The password is stored only in `~/Library/Application Support/com.holmes.QuarkFS/WebDAV-Credentials.json`, readable by the current user only. It is passed to the engine through environment variables, so it does not appear in the process arguments.
 
-如果 Infuse 看不到目录，先回到 QuarkFS 确认“Infuse 本机连接”显示“已就绪”，再点“重新启动”；不要把 `~/Quark` 当作 Infuse 的网络地址。
+If the port is taken, enter another port between 1024 and 65535, click "Apply port" (应用端口), and change the port in Infuse to match. A port already used by another program is refused before the running connection is touched. "Stop" (停止) closes only the Infuse connection and leaves the Finder mount alone. Reopening the window keeps the stopped state for the current run. The connection starts again the next time the app launches.
 
-夸克会在此下载接口上拒绝读取大文件（代码 23018，“download file size limit”）。QuarkFS 会在提示中显示“夸克拒绝下载……（代码 23018）”并在运行记录中写明文件名，而不是静默失败；这类文件目前无法通过 QuarkFS 读取。登录失效时请在“组件与账号”中退出登录后重新扫码。
+If Infuse shows no folders, check that "Infuse local connection" in QuarkFS says "Ready", then click "Restart". Do not enter `~/Quark` as a network address in Infuse.
 
-1.1.1 起，挂载失败会结合本次引擎输出与新增日志说明原因。遇到 macFUSE “Resource busy / 错误 16”时，只有确认本次引擎已退出、目标位置没有挂载，才会等待片刻自动重试一次；仍失败时会保留明确提示。若引擎已退出但 Quark 挂载仍在，会显示需要处理，请关闭使用磁盘的窗口或播放器，再点“卸载 Quark”后重新挂载。卸载会等待系统确认挂载消失且本次引擎退出；无法读取系统挂载状态时，暂停挂载、清理缓存和退出。应用不会强制卸载其他磁盘，也不会删除挂载目录中的文件。
+### Large files
 
-1.1.1 还会在初始化连接之前阻止第二个 QuarkFS 实例，重复打开只激活已运行的应用。macFUSE 资源忙碌也可能来自系统暂时状态；若重新检查与重试后仍失败，可在关闭应用后重启 Mac。
+Quark refuses to serve large files through this download interface (code 23018, "download file size limit"). QuarkFS reports this with the file name instead of failing silently. **Such files cannot be read through QuarkFS for now.** If the login has expired, log out under "Components & account" and scan the QR code again.
 
-## 缓存与安全边界
+### Mount failures
 
-QuarkFS 只读挂载和只读 WebDAV 都会把写入操作拒绝给上游网盘。两条读取路径使用相互独立的缓存子目录，分别应用“平衡约 5 GB / 高性能约 20 GB”的软上限，内存预读按每个打开文件计算。正在读取的文件可能超过软上限；修改缓存策略时，本机 WebDAV 会自动安全重启并应用新参数：
+Since 1.1.1, a failed mount is explained from the engine's output and the new log lines. On a macFUSE "Resource busy / error 16", QuarkFS retries once after a short wait, and only when it has confirmed that the engine has exited and nothing is mounted at the target. If that fails as well, the message stays on screen. If the engine has exited but the Quark mount is still present, the app says that action is needed: close the windows or players using the disk, click "Unmount Quark" (卸载 Quark), then mount again. Unmounting waits until the system confirms the mount is gone and the engine has exited. While the mount state cannot be read, mounting, cache cleaning and quitting are paused. The app never force-unmounts other disks and never deletes files in the mount folder.
+
+Since 1.1.1, a second QuarkFS instance is blocked before any connection is set up; opening the app again only activates the running one. A macFUSE "resource busy" error can also be a temporary system state. If it persists after re-checking and retrying, quit the app and restart the Mac.
+
+## Cache and security boundaries
+
+Both the mount and the WebDAV server are read-only and refuse writes to the drive. The two read paths use separate cache folders. Each applies its own soft limit, about 5 GB for "Balanced" and about 20 GB for "High performance", and read-ahead memory is counted per open file. A file being read can exceed the soft limit. When the cache policy changes, the local WebDAV restarts safely with the new settings.
 
 ```text
 ~/Library/Application Support/com.holmes.QuarkFS
@@ -89,55 +101,61 @@ QuarkFS 只读挂载和只读 WebDAV 都会把写入操作拒绝给上游网盘�
     └── rclone.conf
 ```
 
-运行期配置保存在仅当前用户可访问的目录中，正常退出后删除，异常退出后在下次启动时删除；开启自动清理或零残留模式时，退出也会清理磁盘缓存。缓存清理器会拒绝根目录或中间目录上的符号链接，避免越界删除。挂载磁盘仍在使用、无法卸载时，App 会取消退出并保留连接。扫码期间使用独立的内存 Cookie 存储，完成网盘会话校验后才保存到 macOS 钥匙串；引擎日志只记录 NOTICE 及以上级别，每个日志超过 10 MB 时轮换并只保留一个备份；日志可能包含网络错误和文件路径，请在提交 Issue 前自行检查并脱敏。
+- The runtime configuration is kept in a folder only the current user can access. It is deleted on a normal quit, and on the next launch after a crash.
+- With automatic cleaning or the "No residue" policy, the disk cache is cleared on quit as well.
+- The cache cleaner refuses symbolic links at the root or in intermediate folders, so it cannot delete outside its own directory.
+- If the mounted disk is in use and cannot be unmounted, the app cancels quitting and keeps the connection.
+- During QR login the cookies are held in a separate in-memory store. They are saved to the Keychain only after the drive session has been verified.
+- Engine logs record NOTICE level and above. Each log rotates at 10 MB and keeps one backup. Logs can contain network errors and file paths, so check and redact them before attaching them to an issue.
 
-钥匙串第一次询问时，请输入 Mac 登录密码并选择“始终允许”。应用会在同一次运行中复用已转换的凭据，挂载、卸载、重新挂载不会重复读取钥匙串。ad-hoc 签名的开发包在升级后可能被 macOS 视为新应用并再次询问一次。
+The first time the Keychain asks, enter your Mac login password and choose "Always Allow". The app reuses the converted credential for the rest of the run, so mounting, unmounting and remounting do not read the Keychain again. After an upgrade, macOS may treat an ad-hoc signed build as a new app and ask once more.
 
-## 项目结构
+## Project layout
 
 ```text
-Package.swift                 Swift Package 入口
-Sources/QuarkFS               SwiftUI 窗口、菜单栏、快捷键与生命周期
-Sources/QuarkFSCore           挂载计划、钥匙串、缓存、引擎定位
-Sources/QuarkFSSmokeTests     不依赖账号的核心冒烟测试
-Resources/                    App 图标、Info.plist
-Scripts/01 构建引擎.command   下载校验并构建 rclone（arm64）
-Scripts/02 打包应用.command   测试、编译、签名 App
-Scripts/03 生成发布包.command 生成 ZIP 与 SHA-256
-.github/workflows/ci.yml      GitHub 上的Apple Silicon编译检查
+Package.swift                 Swift Package entry point
+Sources/QuarkFS               SwiftUI window, menu bar, shortcuts, lifecycle
+Sources/QuarkFSCore           Mount plans, Keychain, cache, engine lookup
+Sources/QuarkFSSmokeTests     Core smoke tests that need no account
+Resources/                    App icon, Info.plist
+Scripts/01 构建引擎.command   Download, verify and build rclone (arm64)
+Scripts/02 打包应用.command   Test, compile and sign the app
+Scripts/03 生成发布包.command Produce the ZIP and SHA-256
+.github/workflows/ci.yml      Apple Silicon build check on GitHub
 ```
 
-## 开源致谢
+## Acknowledgements
 
-本项目的 SwiftUI 控制面板、缓存边界、钥匙串封装、Infuse WebDAV 生命周期和打包脚本是本仓库原创代码；挂载和网盘访问能力来自独立的 rclone 引擎构建。QuarkFS 不属于 Quark、Infuse、rclone 或 macFUSE 官方项目。
+The SwiftUI control panel, cache boundaries, Keychain wrapper, Infuse WebDAV lifecycle and packaging scripts are original code in this repository. Mounting and drive access come from a separately built rclone engine. QuarkFS is not an official project of Quark, Infuse, rclone or macFUSE.
 
-- [rclone/rclone](https://github.com/rclone/rclone)：命令行文件同步工具及其通用 VFS/FUSE/WebDAV 能力。
-- [Quark Drive backend PR #9662](https://github.com/rclone/rclone/pull/9662)：夸克后端的公开讨论和实现来源；该 PR 在本项目锁定时仍为 Draft。
-- [zly2006/rclone@47a62e1](https://github.com/zly2006/rclone/tree/47a62e1b6081b5b65664e5e8f2fa7477eba9bd6f)：本项目实际构建的固定提交。构建脚本同时校验归档 SHA-256，避免无意跟随变化的分支。
-- [Cgofuse](https://github.com/winfsp/cgofuse)：rclone 在 macOS 上使用的 FUSE 绑定，遵循其 MIT 许可证。
-- [macFUSE](https://github.com/macfuse/macfuse)：用户自行安装的系统扩展，本项目不重新分发，也不绕过 macOS 的系统扩展安全策略。
+- [rclone/rclone](https://github.com/rclone/rclone): the command-line sync tool and its VFS, FUSE and WebDAV features.
+- [Quark Drive backend PR #9662](https://github.com/rclone/rclone/pull/9662): the public discussion and source of the Quark backend. The PR was still a draft when this project pinned it.
+- [zly2006/rclone@47a62e1](https://github.com/zly2006/rclone/tree/47a62e1b6081b5b65664e5e8f2fa7477eba9bd6f): the exact commit this project builds. The build script also verifies the archive's SHA-256, so it never follows a moving branch.
+- [Cgofuse](https://github.com/winfsp/cgofuse): the FUSE binding rclone uses on macOS, under its MIT license.
+- [macFUSE](https://github.com/macfuse/macfuse): a system extension you install yourself. This project does not redistribute it and does not bypass the macOS system-extension security policy.
 
-完整组件说明和许可证链接见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；本仓库原创代码采用 [MIT License](LICENSE)；风险与责任边界见 [04 免责声明.md](04%20免责声明.md)。
+Component details and license links are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) (Chinese). The original code is under the [MIT License](LICENSE). Risks and responsibilities are described in the [disclaimer](04%20免责声明.md) (Chinese).
 
-## 开发验证
+## Development checks
 
-- `swift run --disable-sandbox --build-system native QuarkFSSmokeTests`：进程大输出/超时、缓存符号链接、挂载路径、旧设置迁移、WebDAV 响应与登录失败回归。
-- `Scripts/04 检查应用行为.command`：使用本机测试服务验证启动、停止、端口切换、清理缓存、退出登录和 App 退出；不使用真实账号。
-- `Scripts/06 检查单实例.command`：用独立进程验证同时启动保护、崩溃后的锁恢复、正常释放与符号链接拒绝。
-- `zsh Tests/QuarkFSCoreTests/ScriptChecks.zsh`：在临时目录中检查测试脚本只链接当前源码、发布脚本拒绝缺少 cmount 的引擎、安装脚本的校验提示与中断恢复，以及 Gatekeeper 说明；不会运行安装脚本本身。
-- 构建引擎后可运行 `python3 Tests/QuarkFSCoreTests/EngineIntegration.py .build/engine/rclone --mount`，使用临时文件检查运行配置解析、WebDAV 认证、分段读取、只读保护、日志参数及 macFUSE 挂载。
-- 已安装并允许 macFUSE 的 Mac 可额外运行 `QUARKFS_TEST_REAL_ENGINE_PATH="$PWD/.build/engine/rclone" QUARKFS_TEST_BUSY_FIRST=1 "Scripts/04 检查应用行为.command"`：通过 AppModel 使用真实引擎挂载临时本地文件，检查读取、卸载、重新挂载、重复点击互斥与一次性 EBUSY 重试，并连续验证六次快速失败的错误捕获；不读取真实夸克账号。测试仅挂载本次创建的临时目录，失败时先尝试正常退出。
-- GitHub CI 同时执行无账号回归检查并编译 Apple Silicon 版本。
+- `swift run --disable-sandbox --build-system native QuarkFSSmokeTests`: large process output and timeouts, cache symbolic links, mount paths, migration of old settings, WebDAV responses and login-failure regressions.
+- `Scripts/04 检查应用行为.command`: uses a local test server to check start, stop, port change, cache cleaning, logout and app quit. No real account is used.
+- `Scripts/06 检查单实例.command`: uses separate processes to check the simultaneous-launch guard, lock recovery after a crash, normal release and refusal of symbolic links.
+- `zsh Tests/QuarkFSCoreTests/ScriptChecks.zsh`: in a temporary folder, checks that the test scripts link only current sources, that the release script refuses an engine without `cmount`, the installer's validation messages and interrupt recovery, and the Gatekeeper instructions. It does not run the installer itself.
+- After building the engine, `python3 Tests/QuarkFSCoreTests/EngineIntegration.py .build/engine/rclone --mount` uses temporary files to check runtime-configuration parsing, WebDAV authentication, ranged reads, read-only protection, log options and the macFUSE mount.
+- On a Mac with macFUSE installed and allowed, you can also run `QUARKFS_TEST_REAL_ENGINE_PATH="$PWD/.build/engine/rclone" QUARKFS_TEST_BUSY_FIRST=1 "Scripts/04 检查应用行为.command"`. It mounts temporary local files with the real engine through AppModel and checks reading, unmounting, remounting, repeated-click exclusion, the single EBUSY retry, and error capture across six quick failures in a row. It does not read a real Quark account, mounts only the temporary folder it created, and tries a normal exit first on failure.
+- GitHub CI runs the account-free regression checks and compiles the Apple Silicon build.
 
-更新内容见 [05 更新记录.md](05%20更新记录.md)。
+Changes are listed in the [changelog](05%20更新记录.md) (Chinese).
 
-## 已知限制
+## Known limitations
 
-- Quark Drive 后端依赖夸克网页端接口和完整浏览器 Cookie；接口、风控或账号策略变化可能导致重新登录或暂时不可用。
-- 上游 Quark 后端仍处于 Draft PR 讨论阶段，因此版本被固定；更新前应重新阅读上游许可证和变更。
-- macFUSE 的系统扩展审批由 macOS 控制。QuarkFS 无法替用户批准扩展，也不能替代 Apple 的 Developer ID 签名和公证。
-- 快捷键是 App 内菜单快捷键，不注册全局事件监听；只有 QuarkFS 处于前台/激活状态时生效，因此不会抢占其他 App 的全局快捷键。
+- Large files that Quark refuses with code 23018 cannot be read (see [Large files](#large-files)).
+- The Quark Drive backend depends on Quark's web interface and a full browser Cookie. Changes to the interface, to risk control or to account policy can force a new login or make the drive unavailable for a while.
+- The upstream Quark backend is still a draft PR, which is why the version is pinned. Re-read the upstream license and changes before updating it.
+- Approval of the macFUSE system extension is controlled by macOS. QuarkFS cannot approve it for you, and it is not a substitute for Apple Developer ID signing and notarization.
+- Shortcuts are in-app menu shortcuts. No global event monitor is registered, so they work only while QuarkFS is the active app and never take over another app's global shortcuts.
 
-## 许可证
+## License
 
-原创代码采用 MIT。发布包中的 rclone 引擎是独立的 GPLv3 组件，必须同时遵守其许可证；不要把 QuarkFS 的 MIT 许可误解为对 rclone 代码的再许可。详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+The original code is under the MIT License. The rclone engine in the release package is a separate component, copyright its authors and under rclone's own MIT license. Keep its copyright and permission notice when you redistribute the package. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
