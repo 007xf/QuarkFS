@@ -85,12 +85,40 @@ final class AppModel: ObservableObject {
     @Published private(set) var logs: [String] = []
     @Published var cookieInput = ""
     @Published var showingLogin = false
+    @Published private(set) var isCheckingForUpdates = false
+    @Published private(set) var updateResult: UpdateChecker.Result?
+    @Published private(set) var knownNewerRelease: UpdateChecker.Release?
+    @Published private(set) var automaticUpdateBanner: UpdateChecker.Release?
+    @Published private(set) var lastUpdateCheck: Date?
+    @Published private(set) var pendingUpdateCardFocus = false
 
     let paths: AppPaths
+    let runningVersion: String?
+
+    var displayVersion: String {
+        guard let runningVersion, !runningVersion.isEmpty else { return "未知版本" }
+        return ReleaseVersion(runningVersion)?.display ?? runningVersion
+    }
+
+    var availableUpdate: UpdateChecker.Release? {
+        if case .newerAvailable(let release) = updateResult { return release }
+        return knownNewerRelease
+    }
 
     private let credentialStore: any CredentialStoring
     private let system: SystemServices
     private let defaults: UserDefaults
+    private let openURL: @MainActor (URL) -> Void
+    private let updateClock: () -> Date
+    private let updateReevaluationInterval: TimeInterval
+    private let wakeGracePeriod: TimeInterval
+    private var previousAutomaticUpdateCheck: Bool
+    private var lastWakeAt: Date?
+    private var updateRecord: UpdateRecord
+    private var updateChecker: UpdateChecker!
+    private var updateScheduleTask: Task<Void, Never>?
+    private var wakeCheckTask: Task<Void, Never>?
+    private var wakeObserver: NSObjectProtocol?
     private var engineProcess: Process?
     /// A mount engine that unmount or quit is stopping on purpose. Its
     /// termination can be handled after that operation has already finished.
@@ -116,6 +144,7 @@ final class AppModel: ObservableObject {
     private var preflightRevision = 0
     private let settingsKey = "QuarkFS.settings.v1"
     private let shortcutsKey = "QuarkFS.shortcuts.v1"
+    private let updateKey = "QuarkFS.update.v1"
 
     /// The running WebDAV engine, for diagnostics and the behaviour checks.
     var infuseBridgeProcessIdentifier: Int32? {
@@ -142,24 +171,101 @@ final class AppModel: ObservableObject {
         credentialStore: any CredentialStoring = KeychainCredentialStore(),
         defaults: UserDefaults = .standard,
         paths: AppPaths = AppPaths(),
-        system: SystemServices = .live
+        system: SystemServices = .live,
+        runningVersion: String? = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+        updateClock: @escaping () -> Date = { Date() },
+        updateReevaluationInterval: TimeInterval = 3600,
+        wakeGracePeriod: TimeInterval = 60,
+        openURL: @escaping @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) },
+        updateTransport: @escaping UpdateChecker.Transport
     ) {
         self.credentialStore = credentialStore
         self.system = system
         self.defaults = defaults
         self.paths = paths
+        self.runningVersion = runningVersion
+        self.updateClock = updateClock
+        self.updateReevaluationInterval = updateReevaluationInterval
+        self.wakeGracePeriod = wakeGracePeriod
+        self.openURL = openURL
+        let initialSettings: AppSettings
         if let data = defaults.data(forKey: settingsKey),
            let decoded = try? JSONDecoder().decode(AppSettings.self, from: data) {
-            settings = decoded
+            initialSettings = decoded
         } else {
-            settings = AppSettings()
+            initialSettings = AppSettings()
         }
+        settings = initialSettings
+        previousAutomaticUpdateCheck = initialSettings.automaticUpdateCheck
         if let data = defaults.data(forKey: shortcutsKey),
            let decoded = try? JSONDecoder().decode(ShortcutPreferences.self, from: data) {
             shortcuts = decoded
         } else {
             shortcuts = ShortcutPreferences()
         }
+        if let data = defaults.data(forKey: updateKey),
+           let decoded = try? JSONDecoder().decode(UpdateRecord.self, from: data) {
+            updateRecord = decoded
+        } else {
+            updateRecord = UpdateRecord()
+        }
+        lastUpdateCheck = [updateRecord.lastCheck, updateRecord.lastOfflineAutomaticAttempt].compactMap { $0 }.max()
+
+        // Restore the last known newer release across relaunches while it is
+        // still newer than the running version; drop it once upgraded or invalid.
+        if let saved = updateRecord.latestKnownRelease {
+            if let running = runningVersion.flatMap(ReleaseVersion.init),
+               let savedVersion = ReleaseVersion(saved.version),
+               let pageURL = UpdateChecker.validateReleasePage(saved.pageURL),
+               running < savedVersion {
+                let restored = UpdateChecker.Release(
+                    parsedVersion: savedVersion,
+                    pageURL: pageURL,
+                    publishedAt: saved.publishedAt,
+                    notes: ""
+                )
+                knownNewerRelease = restored
+                updateResult = .newerAvailable(restored)
+            } else {
+                updateRecord.latestKnownRelease = nil
+                if let data = try? JSONEncoder().encode(updateRecord) {
+                    defaults.set(data, forKey: updateKey)
+                }
+            }
+        }
+
+        updateChecker = UpdateChecker(
+            runningVersion: runningVersion,
+            readSchedule: { [weak self] in
+                guard let self else {
+                    return UpdateChecker.Schedule(automaticEnabled: false, lastCheck: nil, lastAnnouncedVersion: nil)
+                }
+                return UpdateChecker.Schedule(
+                    automaticEnabled: self.settings.automaticUpdateCheck,
+                    lastCheck: self.updateRecord.lastCheck,
+                    lastAnnouncedVersion: self.updateRecord.lastAnnouncedVersion,
+                    lastOfflineAutomaticAttempt: self.updateRecord.lastOfflineAutomaticAttempt,
+                    offlineAutomaticRetryCount: self.updateRecord.offlineAutomaticRetryCount
+                )
+            },
+            recordCheck: { [weak self] date in
+                self?.recordUpdateCheck(at: date)
+            },
+            recordOfflineAutomaticAttempt: { [weak self] date, count in
+                self?.recordOfflineAutomaticUpdateAttempt(at: date, retryCount: count)
+            },
+            recordAnnouncement: { [weak self] version in
+                self?.recordAnnouncedUpdateVersion(version)
+            },
+            clock: updateClock,
+            onCheckingChanged: { [weak self] checking in
+                self?.isCheckingForUpdates = checking
+            },
+            onCheckFinished: { [weak self] result in
+                self?.recordFinishedUpdateCheck(result)
+            },
+            transport: updateTransport
+        )
     }
 
     func shortcut(for action: ShortcutAction) -> AppShortcut {
@@ -212,11 +318,163 @@ final class AppModel: ObservableObject {
             appendLog("初始化失败：\(error.localizedDescription)")
         }
         // A crash or force quit skips the cleanup on quit. Each engine start
-        // writes the config again, so a leftover copy is never needed.
-        try? FileManager.default.removeItem(at: paths.runtimeConfig)
+        // writes the config again, so a leftover copy or temp file is never needed.
+        RuntimeConfiguration.remove(at: paths.runtimeConfig)
         await refreshPreflight()
         refreshCacheUsage()
         await restartInfuseBridge()
+        startAutomaticUpdateSchedule()
+    }
+
+    func checkForUpdatesManually() async {
+        let result = await updateChecker.checkManually()
+        if case .newerAvailable(let release) = result,
+           let banner = automaticUpdateBanner,
+           !(release.parsedVersion < banner.parsedVersion) {
+            automaticUpdateBanner = nil
+        }
+    }
+
+    func checkForUpdatesAutomaticallyIfDue() async {
+        guard !isShuttingDown else { return }
+        if let lastWakeAt {
+            let elapsedSinceWake = updateClock().timeIntervalSince(lastWakeAt)
+            if elapsedSinceWake >= 0 && elapsedSinceWake < wakeGracePeriod {
+                return
+            }
+        }
+        guard await updateChecker.checkAutomaticallyIfDue() != nil else { return }
+        if let notice = updateChecker.takeAutomaticNotice() {
+            automaticUpdateBanner = notice
+        }
+    }
+
+    func openReleasePage(_ release: UpdateChecker.Release) {
+        guard let validated = UpdateChecker.validateReleasePage(release.pageURL.absoluteString) else { return }
+        updateChecker.markAnnounced(release)
+        if let banner = automaticUpdateBanner, !(release.parsedVersion < banner.parsedVersion) {
+            automaticUpdateBanner = nil
+        }
+        openURL(validated)
+    }
+
+    func dismissAutomaticUpdateBanner() {
+        if let banner = automaticUpdateBanner {
+            updateChecker.markAnnounced(banner)
+        }
+        automaticUpdateBanner = nil
+    }
+
+    func requestUpdateCardFocus() {
+        pendingUpdateCardFocus = true
+    }
+
+    @discardableResult
+    func consumeUpdateCardFocus() -> Bool {
+        guard pendingUpdateCardFocus else { return false }
+        pendingUpdateCardFocus = false
+        return true
+    }
+
+    /// Delays automatic update re-evaluation briefly after system wake so
+    /// Wi-Fi has time to associate before a check runs.
+    func handleSystemWake() {
+        lastWakeAt = updateClock()
+        wakeCheckTask?.cancel()
+        let grace = max(0, wakeGracePeriod)
+        wakeCheckTask = Task { @MainActor [weak self] in
+            if grace > 0 {
+                do { try await Task.sleep(for: .seconds(grace)) } catch { return }
+            }
+            guard !Task.isCancelled, let current = self else { return }
+            await current.checkForUpdatesAutomaticallyIfDue()
+        }
+    }
+
+    private func startAutomaticUpdateSchedule() {
+        updateScheduleTask?.cancel()
+        let interval = max(1, updateReevaluationInterval)
+        let tolerance = min(300, interval / 4)
+        updateScheduleTask = Task { @MainActor [weak self] in
+            await self?.checkForUpdatesAutomaticallyIfDue()
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(interval), tolerance: .seconds(tolerance)) } catch { return }
+                guard !Task.isCancelled, let current = self else { return }
+                await current.checkForUpdatesAutomaticallyIfDue()
+            }
+        }
+        if wakeObserver == nil {
+            wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.handleSystemWake()
+                }
+            }
+        }
+    }
+
+    private func stopAutomaticUpdateSchedule() {
+        updateScheduleTask?.cancel()
+        updateScheduleTask = nil
+        wakeCheckTask?.cancel()
+        wakeCheckTask = nil
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
+    }
+
+    private func recordUpdateCheck(at date: Date) {
+        updateRecord.lastCheck = date
+        updateRecord.lastOfflineAutomaticAttempt = nil
+        updateRecord.offlineAutomaticRetryCount = 0
+        lastUpdateCheck = date
+        persistUpdateRecord()
+    }
+
+    private func recordOfflineAutomaticUpdateAttempt(at date: Date, retryCount: Int) {
+        updateRecord.lastOfflineAutomaticAttempt = date
+        updateRecord.offlineAutomaticRetryCount = retryCount
+        lastUpdateCheck = [updateRecord.lastCheck, date].compactMap { $0 }.max()
+        persistUpdateRecord()
+    }
+
+    private func recordAnnouncedUpdateVersion(_ version: String) {
+        updateRecord.lastAnnouncedVersion = version
+        persistUpdateRecord()
+    }
+
+    private func recordFinishedUpdateCheck(_ result: UpdateChecker.Result) {
+        updateResult = result
+        switch result {
+        case .upToDate:
+            knownNewerRelease = nil
+            automaticUpdateBanner = nil
+            if updateRecord.latestKnownRelease != nil {
+                updateRecord.latestKnownRelease = nil
+                persistUpdateRecord()
+            }
+        case .newerAvailable(let release):
+            knownNewerRelease = release
+            updateRecord.latestKnownRelease = UpdateRecord.KnownRelease(
+                version: release.version,
+                pageURL: release.pageURL.absoluteString,
+                publishedAt: release.publishedAt
+            )
+            persistUpdateRecord()
+        case .couldNotCheck:
+            break
+        }
+        appendLog("更新检查：\(result.message)")
+    }
+
+    private func persistUpdateRecord() {
+        if let data = try? JSONEncoder().encode(updateRecord) {
+            defaults.set(data, forKey: updateKey)
+        }
     }
 
     func persistSettings() async {
@@ -226,11 +484,18 @@ final class AppModel: ObservableObject {
                 || $0.cleanupDelaySeconds != settings.cleanupDelaySeconds
                 || $0.infusePort != settings.infusePort
         } == true
+        let autoCheckTurnedOn = !previousAutomaticUpdateCheck && settings.automaticUpdateCheck
+        previousAutomaticUpdateCheck = settings.automaticUpdateCheck
         if let data = try? JSONEncoder().encode(settings) {
             defaults.set(data, forKey: settingsKey)
         }
         if shouldRestartBridge {
             await restartInfuseBridge()
+        }
+        if autoCheckTurnedOn {
+            Task { @MainActor [weak self] in
+                await self?.checkForUpdatesAutomaticallyIfDue()
+            }
         }
     }
 
@@ -418,7 +683,7 @@ final class AppModel: ObservableObject {
             cachedObscuredCookie = nil
             cookieInput = ""
             showingLogin = false
-            try? FileManager.default.removeItem(at: paths.runtimeConfig)
+            RuntimeConfiguration.remove(at: paths.runtimeConfig)
             appendLog(message)
             await startInfuseBridge()
             return true
@@ -439,7 +704,7 @@ final class AppModel: ObservableObject {
             guard await stopInfuseBridge() else { return }
             try credentialStore.delete()
             cachedObscuredCookie = nil
-            try? FileManager.default.removeItem(at: paths.runtimeConfig)
+            RuntimeConfiguration.remove(at: paths.runtimeConfig)
             appendLog("已从钥匙串删除夸克登录信息")
             await refreshPreflight()
         } catch {
@@ -884,12 +1149,13 @@ final class AppModel: ObservableObject {
         }
         guard await stopInfuseBridge() else { return false }
         if unmounted {
-            try? FileManager.default.removeItem(at: paths.runtimeConfig)
+            RuntimeConfiguration.remove(at: paths.runtimeConfig)
         }
         if settings.profile == .zeroResidual || settings.autoCleanup {
             let manager = SafeCacheManager(cacheRoot: paths.cacheDirectory, allowedParent: paths.supportDirectory)
             try? await Task.detached { try manager.clear() }.value
         }
+        stopAutomaticUpdateSchedule()
         return true
     }
 
@@ -957,7 +1223,7 @@ final class AppModel: ObservableObject {
         let presence = mountPresence(at: mountPath)
         mountStateKnown = presence != .unknown
         if infuseBridgeProcess?.isRunning != true {
-            try? FileManager.default.removeItem(at: paths.runtimeConfig)
+            RuntimeConfiguration.remove(at: paths.runtimeConfig)
         }
 
         if presence == .none, settings.profile == .zeroResidual || settings.autoCleanup {
@@ -1121,3 +1387,22 @@ final class AppModel: ObservableObject {
         }
     }
 }
+
+#if QUARKFS_SNAPSHOTS
+extension AppModel {
+    /// Prepares a deterministic offline state for README window snapshots.
+    /// Runs real preflight against injected SystemServices without starting a
+    /// live WebDAV listener on port 8686 or touching any real mount folder.
+    func bootstrapReadmeFixture(cacheBytes: Int64, logs: [String]) async {
+        hasBootstrapped = true
+        try? paths.prepare()
+        await refreshPreflight()
+        infuseBridgeRunning = true
+        infuseBridgeActive = true
+        infuseBridgeDetail = "已就绪 · 127.0.0.1:\(settings.infusePort)"
+        self.cacheBytes = cacheBytes
+        self.logs = logs
+        readIssue = nil
+    }
+}
+#endif

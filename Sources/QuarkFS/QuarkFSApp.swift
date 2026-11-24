@@ -10,7 +10,7 @@ struct QuarkFSApp: App {
 
     init() {
         instanceLock = SingleInstanceApplication.acquireOrActivateExisting()
-        _model = StateObject(wrappedValue: AppModel())
+        _model = StateObject(wrappedValue: AppModel(updateTransport: UpdateChecker.liveTransport()))
     }
 
     var body: some Scene {
@@ -24,12 +24,11 @@ struct QuarkFSApp: App {
         MenuBarExtra {
             MenuBarContent(model: model)
         } label: {
-            Image(systemName: "atom")
-                .symbolRenderingMode(.monochrome)
-                .font(.system(size: 16, weight: .medium))
-                .frame(width: 18, height: 17)
-                .padding(.horizontal, 3)
-                .accessibilityLabel("QuarkFS · \(model.status.title)")
+            let hasReadIssue = model.readIssue != nil
+            let glyphState = MenuBarGlyphState.from(status: model.status, hasReadIssue: hasReadIssue)
+            let label = MenuBarGlyph.accessibilityLabel(for: model.status, hasReadIssue: hasReadIssue)
+            Image(nsImage: MenuBarGlyph.image(for: glyphState))
+                .accessibilityLabel(label)
         }
         .menuBarExtraStyle(.menu)
 
@@ -50,6 +49,15 @@ private struct QuarkFSCommands: Commands {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("检查更新…") {
+                openWindow(id: "main")
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                model.requestUpdateCardFocus()
+                Task { await model.checkForUpdatesManually() }
+            }
+        }
+
         CommandMenu("QuarkFS 操作") {
             Button("显示 QuarkFS") {
                 openWindow(id: "main")
@@ -363,6 +371,20 @@ private struct MenuBarContent: View {
         Button("打开 Infuse") { model.openInfuse() }
 
         Divider()
+
+        if let release = model.availableUpdate {
+            Text("有新版本 \(release.version)")
+            Button("查看发行页面") {
+                model.openReleasePage(release)
+            }
+        }
+
+        Button("检查更新…") {
+            openWindow(id: "main")
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            model.requestUpdateCardFocus()
+            Task { await model.checkForUpdatesManually() }
+        }
 
         SettingsLink {
             Text("自定义快捷键…")

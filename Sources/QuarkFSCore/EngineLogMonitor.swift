@@ -10,7 +10,7 @@ public enum EngineIssue: Hashable, Sendable {
     public var message: String {
         switch self {
         case .downloadSizeLimit(let file):
-            "夸克拒绝下载\(file.map { "“\($0)”" } ?? "该文件")：网页端下载大小限制（代码 23018）"
+            "夸克拒绝下载\(file.map { "“\($0)”" } ?? "该文件")：下载大小限制（代码 23018）"
         case .loginExpired:
             "夸克登录已失效，请在“组件与账号”中退出登录后重新扫码"
         case .repeatedReadFailures(let file):

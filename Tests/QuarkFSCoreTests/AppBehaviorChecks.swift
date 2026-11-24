@@ -3,6 +3,46 @@ import Darwin
 import Foundation
 import QuarkFSCore
 
+private final class StubUpdateTransport: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var response: UpdateChecker.HTTPResponse
+    private var failOffline = false
+
+    init(tag: String = "v1.1.3", body: String = "stub notes") {
+        let json = """
+        {"tag_name":"\(tag)","html_url":"https://github.com/007xf/QuarkFS/releases/tag/\(tag)","published_at":"2026-11-24T10:00:00Z","body":"\(body)"}
+        """
+        self.response = UpdateChecker.HTTPResponse(statusCode: 200, data: Data(json.utf8))
+    }
+
+    var callCount: Int { lock.withLock { count } }
+
+    func setFailOffline(_ flag: Bool) {
+        lock.withLock { failOffline = flag }
+    }
+
+    func setRelease(tag: String, body: String = "stub notes") {
+        let json = """
+        {"tag_name":"\(tag)","html_url":"https://github.com/007xf/QuarkFS/releases/tag/\(tag)","published_at":"2026-11-24T10:00:00Z","body":"\(body)"}
+        """
+        lock.withLock {
+            failOffline = false
+            response = UpdateChecker.HTTPResponse(statusCode: 200, data: Data(json.utf8))
+        }
+    }
+
+    func makeTransport() -> UpdateChecker.Transport {
+        { [self] _, _ in
+            try self.lock.withLock {
+                self.count += 1
+                if self.failOffline { throw UpdateChecker.Failure.offline }
+                return self.response
+            }
+        }
+    }
+}
+
 private final class TestCredentials: CredentialStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var value: String? = "test-only-cookie"
@@ -89,13 +129,23 @@ struct AppBehaviorChecks {
         setup.engine = EngineInspection(path: "fixture", isQuarkCapable: true, mountCommand: "nfsmount", version: nil, problem: nil)
         try require(setup.needsSetup, "an engine without cmount is not considered fully configured")
 
+        try checkMenuBarGlyph()
+
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(".build/AppBehavior-\(UUID().uuidString)")
         let paths = AppPaths(baseDirectory: root.appendingPathComponent("Support"))
         let suite = "QuarkFS.Tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         let credentials = TestCredentials()
-        let model = AppModel(credentialStore: credentials, defaults: defaults, paths: paths)
+        let stubUpdates = StubUpdateTransport(tag: "v1.1.3")
+        let model = AppModel(
+            credentialStore: credentials,
+            defaults: defaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            openURL: { _ in },
+            updateTransport: stubUpdates.makeTransport()
+        )
         model.settings.mountPath = root.appendingPathComponent("Mount").path
         model.settings.infusePort = try freePort()
         model.settings.openFinderAfterMount = false
@@ -105,7 +155,12 @@ struct AppBehaviorChecks {
         }
 
         do {
+            try paths.prepare()
+            let bootLeftover = paths.runtimeDirectory.appendingPathComponent(".rclone-boot-leftover.tmp")
+            try Data("leftover-secret".utf8).write(to: bootLeftover)
             await model.bootstrap()
+            try require(!FileManager.default.fileExists(atPath: bootLeftover.path),
+                        "bootstrap removes leftover .rclone-*.tmp files from a prior crash")
             try require(model.infuseBridgeRunning && !model.isBusy, "bootstrap checks an actual HTTP response")
             try require(credentials.loadCount == 1, "credentials read once")
             try require(await anonymousConnection(port: model.settings.infusePort) != .ready,
@@ -147,9 +202,9 @@ struct AppBehaviorChecks {
                         && configLines.contains("cookie = \(fixtureObscured("test-only-cookie"))"),
                         "runtime config names the quark remote and carries the obscured Keychain cookie")
             try require(try permissions(of: paths.runtimeConfig) == 0o600, "runtime config is readable only by the user")
-            try require(!configLines.contains { $0.hasPrefix("user_agent") },
-                        "runtime config does not override the engine user agent")
-            try require(configLines.count == 3, "runtime config contains only the remote section, type and cookie")
+            try require(configLines.contains("user_agent = \(quarkClientUserAgent)"),
+                        "engine requests download links as the Quark PC client, not as the web page")
+            try require(configLines.count == 4, "runtime config contains only the remote type, cookie and user agent")
             try require(model.preflight.hasCompletedCheck, "the first live preflight resolves setup visibility")
             let oldPort = model.settings.infusePort
             let newPort = try freePort()
@@ -160,7 +215,8 @@ struct AppBehaviorChecks {
             try require(credentials.loadCount == 1, "restart reuses the credential")
 
             let conflict = AppModel(credentialStore: TestCredentials(), defaults: UserDefaults(suiteName: suite + ".conflict")!,
-                                    paths: AppPaths(baseDirectory: root.appendingPathComponent("ConflictSupport")))
+                                    paths: AppPaths(baseDirectory: root.appendingPathComponent("ConflictSupport")),
+                                    runningVersion: "1.1.3", openURL: { _ in }, updateTransport: StubUpdateTransport().makeTransport())
             conflict.settings.mountPath = originalSafeMount(root)
             conflict.settings.infusePort = newPort
             await conflict.bootstrap()
@@ -178,7 +234,8 @@ struct AppBehaviorChecks {
                 try Data(mode.utf8).write(to: failingPaths.supportDirectory.appendingPathComponent("webdav-failure-mode"))
                 let failingSuite = suite + ".failing-\(mode)"
                 let failing = AppModel(credentialStore: TestCredentials(), defaults: UserDefaults(suiteName: failingSuite)!,
-                                       paths: failingPaths)
+                                       paths: failingPaths, runningVersion: "1.1.3", openURL: { _ in },
+                                       updateTransport: StubUpdateTransport().makeTransport())
                 failing.settings.mountPath = root.appendingPathComponent("FailingMount").path
                 failing.settings.infusePort = try freePort()
                 await failing.bootstrap()
@@ -255,7 +312,9 @@ struct AppBehaviorChecks {
                 let busySuite = suite + ".busy"
                 let busyDefaults = UserDefaults(suiteName: busySuite)!
                 defer { busyDefaults.removePersistentDomain(forName: busySuite) }
-                let busyModel = AppModel(credentialStore: TestCredentials(), defaults: busyDefaults, paths: busyPaths)
+                let busyModel = AppModel(credentialStore: TestCredentials(), defaults: busyDefaults, paths: busyPaths,
+                                         runningVersion: "1.1.3", openURL: { _ in },
+                                         updateTransport: StubUpdateTransport().makeTransport())
                 busyModel.settings.mountPath = root.appendingPathComponent("BusyMount").path
                 busyModel.settings.openFinderAfterMount = false
                 for cycle in 1...3 {
@@ -296,11 +355,16 @@ struct AppBehaviorChecks {
             try await checkUnmountOutcomes(root: root, suite: suite)
             try await checkRelaunchAfterCrash(root: root, suite: suite)
             try await checkRelaunchAfterCrash(root: root, suite: suite, loggedOut: true)
+            try await checkUpdateLifecycle(root: root, suite: suite)
 
+            let forgetLeftover = paths.runtimeDirectory.appendingPathComponent(".rclone-forget-leftover.tmp")
+            try Data("leftover-secret".utf8).write(to: forgetLeftover)
             await model.forgetCredential()
             try require(!model.infuseBridgeActive && !model.preflight.hasCredential, "logout stops the bridge")
             try require(model.preflight.needsSetup, "logout refreshes the visible setup requirement")
             try require(!FileManager.default.fileExists(atPath: paths.runtimeConfig.path), "logout removes runtime credentials")
+            try require(!FileManager.default.fileExists(atPath: forgetLeftover.path),
+                        "logout removes leftover .rclone-*.tmp files alongside rclone.conf")
             model.cookieInput = "replacement-test-only-cookie"
             await model.saveCookie()
             try require(model.infuseBridgeRunning && credentials.loadCount == 2, "new login invalidates cached credentials")
@@ -312,10 +376,16 @@ struct AppBehaviorChecks {
                         "a login while still logged in re-reads the new credential instead of the cached one")
             try require(try runtimeConfigLines(paths).contains("cookie = \(fixtureObscured("second-test-only-cookie"))"),
                         "a login while still logged in writes the new cookie to the runtime config")
+            let quitLeftover = paths.runtimeDirectory.appendingPathComponent(".rclone-quit-leftover.tmp")
+            try Data("leftover-secret".utf8).write(to: quitLeftover)
             try require(await model.shutdownNow(), "application can shut down cleanly")
             try require(await connection(port: newPort, authorization: bridgeAuthorization) != .ready, "quit leaves no listener")
             try require(!FileManager.default.fileExists(atPath: paths.runtimeConfig.path), "quit removes runtime credentials")
-            print("PASS: application startup, readiness, WebDAV authentication, runtime config, read-error reporting, port change and rollback, stop/restart, crash recovery, window reopening, cache cleanup, cancelled quit, login during other work, unmount outcomes, logout/login and shutdown")
+            try require(!FileManager.default.fileExists(atPath: quitLeftover.path),
+                        "quit removes leftover .rclone-*.tmp files alongside rclone.conf")
+            try require(UpdateChecker.liveTransportConstructionCount == 0 && UpdateChecker.liveTransportCallCount == 0,
+                        "no live update transport may be constructed or called during application behavior checks")
+            print("PASS: application startup, readiness, WebDAV authentication, runtime config, read-error reporting, port change and rollback, stop/restart, crash recovery, window reopening, cache cleanup, cancelled quit, login during other work, unmount outcomes, update checks, logout/login and shutdown")
         } catch {
             _ = await model.shutdownNow()
             throw error
@@ -331,7 +401,8 @@ struct AppBehaviorChecks {
         let defaultsSuite = suite + ".fake-system"
         defer { UserDefaults.standard.removePersistentDomain(forName: defaultsSuite) }
         let model = AppModel(credentialStore: TestCredentials(), defaults: UserDefaults(suiteName: defaultsSuite)!,
-                             paths: paths, system: fake.services)
+                             paths: paths, system: fake.services, runningVersion: "1.1.3", openURL: { _ in },
+                             updateTransport: StubUpdateTransport().makeTransport())
         model.settings.mountPath = root.appendingPathComponent("FakeMount").path
         model.settings.infusePort = try freePort()
         model.settings.openFinderAfterMount = false
@@ -383,7 +454,8 @@ struct AppBehaviorChecks {
         let defaultsSuite = suite + ".login-race"
         defer { UserDefaults.standard.removePersistentDomain(forName: defaultsSuite) }
         let model = AppModel(credentialStore: credentials, defaults: UserDefaults(suiteName: defaultsSuite)!,
-                             paths: paths, system: fake.services)
+                             paths: paths, system: fake.services, runningVersion: "1.1.3", openURL: { _ in },
+                             updateTransport: StubUpdateTransport().makeTransport())
         model.settings.mountPath = root.appendingPathComponent("LoginRaceMount").path
         model.settings.infusePort = try freePort()
         do {
@@ -432,7 +504,8 @@ struct AppBehaviorChecks {
         let defaultsSuite = suite + ".unmount"
         defer { UserDefaults.standard.removePersistentDomain(forName: defaultsSuite) }
         let model = AppModel(credentialStore: TestCredentials(), defaults: UserDefaults(suiteName: defaultsSuite)!,
-                             paths: paths, system: fake.services)
+                             paths: paths, system: fake.services, runningVersion: "1.1.3", openURL: { _ in },
+                             updateTransport: StubUpdateTransport().makeTransport())
         model.settings.mountPath = root.appendingPathComponent("UnmountMount").path
         model.settings.infusePort = try freePort()
         model.settings.openFinderAfterMount = false
@@ -473,7 +546,8 @@ struct AppBehaviorChecks {
     /// force quit, leaving the WebDAV engine running without its app.
     @MainActor static func crashAfterBootstrap(support: URL, port: Int, suite: String) async throws {
         let model = AppModel(credentialStore: TestCredentials(), defaults: UserDefaults(suiteName: suite)!,
-                             paths: AppPaths(baseDirectory: support))
+                             paths: AppPaths(baseDirectory: support), runningVersion: "1.1.3", openURL: { _ in },
+                             updateTransport: StubUpdateTransport().makeTransport())
         model.settings.mountPath = support.deletingLastPathComponent().appendingPathComponent("CrashMount").path
         model.settings.infusePort = port
         await model.bootstrap()
@@ -505,7 +579,8 @@ struct AppBehaviorChecks {
         let relaunchCredentials = TestCredentials()
         if loggedOut { try relaunchCredentials.delete() }
         let model = AppModel(credentialStore: relaunchCredentials, defaults: UserDefaults(suiteName: defaultsSuite)!,
-                             paths: AppPaths(baseDirectory: support))
+                             paths: AppPaths(baseDirectory: support), runningVersion: "1.1.3", openURL: { _ in },
+                             updateTransport: StubUpdateTransport().makeTransport())
         model.settings.mountPath = root.appendingPathComponent("CrashMount").path
         model.settings.infusePort = port
         await model.bootstrap()
@@ -527,6 +602,446 @@ struct AppBehaviorChecks {
         try require(leftoverStopped, "the leftover engine is stopped, not left serving beside the new one")
     }
 
+    /// Menu-bar glyph mapping covers every MountStatus case plus read issues,
+    /// builds accurate VoiceOver labels, caches 22x22 pt template images, keeps
+    /// cut-outs transparent beside solid ink, and differentiates all four states.
+    @MainActor static func checkMenuBarGlyph() throws {
+        let allStatuses: [(MountStatus, MenuBarGlyphState, String, String)] = [
+            (.notMounted, .idle, "QuarkFS · 未挂载", "QuarkFS · 未挂载 · 需要处理"),
+            (.mounting, .busy, "QuarkFS · 正在挂载", "QuarkFS · 正在挂载 · 需要处理"),
+            (.unmounting, .busy, "QuarkFS · 正在卸载", "QuarkFS · 正在卸载 · 需要处理"),
+            (.mounted, .mounted, "QuarkFS · 已挂载", "QuarkFS · 已挂载 · 需要处理"),
+            (.failed("err"), .attention, "QuarkFS · 需要处理", "QuarkFS · 需要处理")
+        ]
+        for (status, expectedState, normalLabel, readIssueLabel) in allStatuses {
+            try require(MenuBarGlyphState.from(status: status, hasReadIssue: false) == expectedState,
+                        "status \(status) maps to \(expectedState)")
+            try require(MenuBarGlyphState.from(status: status, hasReadIssue: true) == .attention,
+                        "status \(status) with read issue maps to attention")
+            try require(MenuBarGlyph.accessibilityLabel(for: status, hasReadIssue: false) == normalLabel,
+                        "accessibility label for \(status) must be \(normalLabel)")
+            try require(MenuBarGlyph.accessibilityLabel(for: status, hasReadIssue: true) == readIssueLabel,
+                        "accessibility label for \(status) with read issue must be \(readIssueLabel)")
+        }
+
+        var bitmaps: [MenuBarGlyphState: Data] = [:]
+        for state in MenuBarGlyphState.allCases {
+            let image = MenuBarGlyph.image(for: state)
+            try require(image === MenuBarGlyph.image(for: state), "menu-bar glyph \(state) must be cached")
+            try require(image.isTemplate, "menu-bar glyph \(state) must be a template image")
+            try require(image.size == NSSize(width: 22, height: 22), "menu-bar glyph \(state) must be 22x22 pt")
+
+            // Rasterize at 2x into an RGBA bitmap and verify ink coverage, positive controls & transparent cut-outs.
+            let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: 44, pixelsHigh: 44,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+            )!
+            rep.size = NSSize(width: 22, height: 22)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            image.draw(in: NSRect(x: 0, y: 0, width: 22, height: 22))
+            NSGraphicsContext.restoreGraphicsState()
+
+            var opaquePixels = 0
+            var alphaBytes: [UInt8] = []
+            alphaBytes.reserveCapacity(44 * 44)
+            for y in 0..<44 {
+                for x in 0..<44 {
+                    let alpha = rep.colorAt(x: x, y: y)?.alphaComponent ?? 0
+                    alphaBytes.append(UInt8(min(255, max(0, Int((alpha * 255).rounded())))))
+                    if alpha > 0.5 { opaquePixels += 1 }
+                }
+            }
+            try require(opaquePixels > 100, "menu-bar glyph \(state) draws visible strokes")
+            bitmaps[state] = Data(alphaBytes)
+
+            switch state {
+            case .idle:
+                // Positive control on drive top stroke (11, 13) -> (22, 26) and LED dot (15.4, 16) -> (31, 32).
+                let strokeAlpha = rep.colorAt(x: 22, y: 26)?.alphaComponent ?? 0
+                let ledAlpha = rep.colorAt(x: 31, y: 32)?.alphaComponent ?? 0
+                try require(strokeAlpha > 0.9 && ledAlpha > 0.9, "idle glyph draws opaque drive stroke and LED")
+            case .busy:
+                // Positive control on centre dot (11, 16) -> (22, 32) and stream curve (11.1, 9.5) -> (22, 19).
+                let centerDotAlpha = rep.colorAt(x: 22, y: 32)?.alphaComponent ?? 0
+                let streamAlpha = rep.colorAt(x: 22, y: 19)?.alphaComponent ?? 0
+                try require(centerDotAlpha > 0.9 && streamAlpha > 0.9, "busy glyph draws opaque stream and dots")
+            case .mounted:
+                // Cut-outs: slot (8.45, 16) -> (17, 32) and LED (15.4, 16) -> (31, 32).
+                // Positive controls right beside cut-outs on solid drive body: (8.45, 13.8) -> (17, 28) and (13.0, 16) -> (26, 32).
+                let slotAlpha = rep.colorAt(x: 17, y: 32)?.alphaComponent ?? 1
+                let ledAlpha = rep.colorAt(x: 31, y: 32)?.alphaComponent ?? 1
+                let bodyAboveSlot = rep.colorAt(x: 17, y: 28)?.alphaComponent ?? 0
+                let bodyBetween = rep.colorAt(x: 26, y: 32)?.alphaComponent ?? 0
+                try require(slotAlpha < 0.05 && ledAlpha < 0.05 && bodyAboveSlot > 0.9 && bodyBetween > 0.9,
+                            "mounted drive cut-outs must be transparent beside opaque solid body")
+            case .attention:
+                // Cut-outs: stem (17, 15.6) -> (34, 31), dot (17, 18.75) -> (34, 37), clear ring (12.4, 16.6) -> (25, 33).
+                // Positive controls on badge disc beside '!' at (14.5, 16.6) -> (29, 33) and (19.5, 16.6) -> (39, 33).
+                let stemAlpha = rep.colorAt(x: 34, y: 31)?.alphaComponent ?? 1
+                let dotAlpha = rep.colorAt(x: 34, y: 37)?.alphaComponent ?? 1
+                let ringAlpha = rep.colorAt(x: 25, y: 33)?.alphaComponent ?? 1
+                let discLeft = rep.colorAt(x: 29, y: 33)?.alphaComponent ?? 0
+                let discRight = rep.colorAt(x: 39, y: 33)?.alphaComponent ?? 0
+                try require(stemAlpha < 0.05 && dotAlpha < 0.05 && ringAlpha < 0.05 && discLeft > 0.9 && discRight > 0.9,
+                            "attention badge cut-outs and clear ring must be transparent beside opaque badge disc")
+            }
+        }
+
+        let states = MenuBarGlyphState.allCases
+        for i in 0..<states.count {
+            for j in (i + 1)..<states.count {
+                try require(bitmaps[states[i]] != bitmaps[states[j]],
+                            "menu-bar glyphs \(states[i]) and \(states[j]) must differ visually")
+            }
+        }
+    }
+
+    /// Automatic update checks persist their toggle and record without touching
+    /// the WebDAV bridge, announce each version once across restarts, and never
+    /// leak response bodies into the activity log.
+    @MainActor static func checkUpdateLifecycle(root: URL, suite: String) async throws {
+        let paths = AppPaths(baseDirectory: root.appendingPathComponent("UpdateSupport"))
+        try paths.prepare()
+        let defaultsSuite = suite + ".updates"
+        let defaults = UserDefaults(suiteName: defaultsSuite)!
+        defer { defaults.removePersistentDomain(forName: defaultsSuite) }
+
+        // Seed legacy settings without `automaticUpdateCheck`: must decode to true.
+        let mountPath = root.appendingPathComponent("UpdateMount").path
+        let port = try freePort()
+        let legacyJSON = """
+        {"mountPath":"\(mountPath)","profile":"zeroResidual","autoCleanup":true,"cleanupDelaySeconds":60,"openFinderAfterMount":false,"infusePort":\(port)}
+        """
+        defaults.set(Data(legacyJSON.utf8), forKey: "QuarkFS.settings.v1")
+
+        var now = Date(timeIntervalSince1970: 1_764_000_000)
+        var openedURLs: [URL] = []
+        let stub = StubUpdateTransport(tag: "v1.2.0", body: "secret-release-body-marker")
+
+        let first = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: defaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { now },
+            openURL: { openedURLs.append($0) },
+            updateTransport: stub.makeTransport()
+        )
+        do {
+            try require(first.settings.automaticUpdateCheck == true,
+                        "legacy settings without automaticUpdateCheck decode with automatic checks enabled")
+            await first.bootstrap()
+            try require(first.infuseBridgeRunning, "update-check test model starts its bridge")
+            try require(await waitUntil { first.automaticUpdateBanner?.version == "1.2.0" },
+                        "automatic check at launch announces a newer release once")
+            try require(first.logs.contains { $0.contains("更新检查：发现新版本 1.2.0") },
+                        "finished update check writes one summary line to the activity log")
+            try require(!first.logs.contains { $0.contains("secret-release-body-marker") },
+                        "activity log never includes the response body")
+
+            // Toggling automaticUpdateCheck must persist and never restart the WebDAV bridge.
+            let startCountFile = paths.supportDirectory.appendingPathComponent("webdav-start-count")
+            let startsBeforeToggle = try Int(String(contentsOf: startCountFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))
+            let pidBeforeToggle = first.infuseBridgeProcessIdentifier
+            first.settings.automaticUpdateCheck = false
+            await first.persistSettings()
+            let savedOff = defaults.data(forKey: "QuarkFS.settings.v1")
+                .flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }?.automaticUpdateCheck
+            first.settings.automaticUpdateCheck = true
+            await first.persistSettings()
+            let savedOn = defaults.data(forKey: "QuarkFS.settings.v1")
+                .flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) }?.automaticUpdateCheck
+            let startsAfterToggle = try Int(String(contentsOf: startCountFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))
+            try require(savedOff == false && savedOn == true,
+                        "automaticUpdateCheck toggle persists across saves")
+            try require(startsBeforeToggle == startsAfterToggle && first.infuseBridgeProcessIdentifier == pidBeforeToggle && first.infuseBridgeRunning,
+                        "toggling automaticUpdateCheck must not restart the WebDAV bridge or touch the engine")
+
+            // One-shot update card focus resets after consumption (U5).
+            try require(!first.pendingUpdateCardFocus && !first.consumeUpdateCardFocus(),
+                        "update card focus starts inactive")
+            first.requestUpdateCardFocus()
+            try require(first.pendingUpdateCardFocus && first.consumeUpdateCardFocus()
+                        && !first.pendingUpdateCardFocus && !first.consumeUpdateCardFocus(),
+                        "update card focus is one-shot and never replays on later window openings")
+
+            // Dismissing the banner hides it.
+            first.dismissAutomaticUpdateBanner()
+            try require(first.automaticUpdateBanner == nil, "dismissing the automatic update banner hides it")
+            try require(await first.shutdownNow(), "first update-check model shuts down cleanly")
+        } catch {
+            _ = await first.shutdownNow()
+            throw error
+        }
+
+        // Immediate relaunch within 24h (no new check): remembers 1.2.0 in card/menu
+        // without re-showing the automatic banner (C3).
+        let rememberedCalls = stub.callCount
+        let remembered = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: defaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { now },
+            openURL: { openedURLs.append($0) },
+            updateTransport: stub.makeTransport()
+        )
+        try require(remembered.availableUpdate?.version == "1.2.0" && remembered.automaticUpdateBanner == nil,
+                    "relaunch restores the last known newer release without re-showing the banner")
+        try require(stub.callCount == rememberedCalls, "restoring known release requires no network call")
+
+        // Launching as the upgraded version 1.2.0 drops the saved known release (C3).
+        let upgradedDefaultsSuite = suite + ".updates-upgraded"
+        let upgradedDefaults = UserDefaults(suiteName: upgradedDefaultsSuite)!
+        defer { upgradedDefaults.removePersistentDomain(forName: upgradedDefaultsSuite) }
+        if let savedUpdateData = defaults.data(forKey: "QuarkFS.update.v1") {
+            upgradedDefaults.set(savedUpdateData, forKey: "QuarkFS.update.v1")
+        }
+        let upgraded = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: upgradedDefaults,
+            paths: paths,
+            runningVersion: "1.2.0",
+            updateClock: { now },
+            openURL: { _ in },
+            updateTransport: stub.makeTransport()
+        )
+        try require(upgraded.availableUpdate == nil && upgraded.updateResult == nil,
+                    "saved newer release is dropped once the running version reaches it")
+
+        // Tampered saved releases (external URL, non-newer version, or invalid version) must be dropped on init.
+        let tamperedCases: [(name: String, version: String, url: String)] = [
+            ("external-url", "1.9.0", "https://evil.example/007xf/QuarkFS/releases/tag/v1.9.0"),
+            ("older-version", "1.0.0", "https://github.com/007xf/QuarkFS/releases/tag/v1.0.0"),
+            ("invalid-version", "not-a-version", "https://github.com/007xf/QuarkFS/releases/tag/v1.9.0")
+        ]
+        for tampered in tamperedCases {
+            let tamperedSuite = suite + ".tampered-\(tampered.name)"
+            let tamperedDefaults = UserDefaults(suiteName: tamperedSuite)!
+            defer { tamperedDefaults.removePersistentDomain(forName: tamperedSuite) }
+            let record = UpdateRecord(
+                lastCheck: now,
+                latestKnownRelease: .init(version: tampered.version, pageURL: tampered.url, publishedAt: now)
+            )
+            tamperedDefaults.set(try JSONEncoder().encode(record), forKey: "QuarkFS.update.v1")
+            let checked = AppModel(
+                credentialStore: TestCredentials(),
+                defaults: tamperedDefaults,
+                paths: paths,
+                runningVersion: "1.1.3",
+                updateClock: { now },
+                openURL: { _ in },
+                updateTransport: stub.makeTransport()
+            )
+            let reloadedRecord = tamperedDefaults.data(forKey: "QuarkFS.update.v1")
+                .flatMap { try? JSONDecoder().decode(UpdateRecord.self, from: $0) }
+            try require(checked.availableUpdate == nil && checked.updateResult == nil
+                        && reloadedRecord?.latestKnownRelease == nil,
+                        "tampered saved release (\(tampered.name)) must be dropped and purged from defaults")
+        }
+
+        // Known newer release stays available in card/menu even after a subsequent offline failure.
+        let rememberedFailStub = StubUpdateTransport(tag: "v1.2.0")
+        rememberedFailStub.setFailOffline(true)
+        let rememberedFailSuite = suite + ".remembered-fail"
+        let rememberedFailDefaults = UserDefaults(suiteName: rememberedFailSuite)!
+        defer { rememberedFailDefaults.removePersistentDomain(forName: rememberedFailSuite) }
+        if let savedUpdateData = defaults.data(forKey: "QuarkFS.update.v1") {
+            rememberedFailDefaults.set(savedUpdateData, forKey: "QuarkFS.update.v1")
+        }
+        let rememberedFail = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: rememberedFailDefaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { now },
+            openURL: { _ in },
+            updateTransport: rememberedFailStub.makeTransport()
+        )
+        await rememberedFail.checkForUpdatesManually()
+        try require(rememberedFail.updateResult == .couldNotCheck(.offline)
+                    && rememberedFail.availableUpdate?.version == "1.2.0",
+                    "remembered newer release remains available in card and menu when a later check fails offline")
+
+        // Restart with the same UserDefaults 25 hours later: 1.2.0 was already announced,
+        // so the automatic check runs again without re-showing the banner.
+        now = now.addingTimeInterval(25 * 60 * 60)
+        let callsBeforeSecond = stub.callCount
+        let second = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: defaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { now },
+            openURL: { openedURLs.append($0) },
+            updateTransport: stub.makeTransport()
+        )
+        do {
+            await second.bootstrap()
+            try require(await waitUntil { stub.callCount > callsBeforeSecond && second.updateResult != nil },
+                        "restarted model runs the due automatic update check")
+            try require(second.automaticUpdateBanner == nil,
+                        "an already-announced version does not show the automatic banner again after restart")
+            try require(await second.shutdownNow(), "second update-check model shuts down cleanly")
+        } catch {
+            _ = await second.shutdownNow()
+            throw error
+        }
+
+        // A newer release 1.3.0 another 25 hours later DOES announce again, and opening
+        // its release page validates the URL and dismisses the banner.
+        now = now.addingTimeInterval(25 * 60 * 60)
+        stub.setRelease(tag: "v1.3.0", body: "third-release")
+        let third = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: defaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { now },
+            openURL: { openedURLs.append($0) },
+            updateTransport: stub.makeTransport()
+        )
+        do {
+            await third.bootstrap()
+            try require(await waitUntil { third.automaticUpdateBanner?.version == "1.3.0" },
+                        "a newer release after an announced version shows the automatic banner again")
+            if let release = third.automaticUpdateBanner {
+                third.openReleasePage(release)
+            }
+            try require(third.automaticUpdateBanner == nil
+                        && openedURLs.last?.absoluteString == "https://github.com/007xf/QuarkFS/releases/tag/v1.3.0",
+                        "opening the release page opens the validated GitHub URL and dismisses the banner")
+            try require(await third.shutdownNow(), "third update-check model shuts down cleanly")
+        } catch {
+            _ = await third.shutdownNow()
+            throw error
+        }
+
+        // Switch off = no automatic request at launch, at a tick, or at wake (T4);
+        // turning the switch on with a stale lastCheck evaluates promptly (C4).
+        let offSuite = suite + ".updates-off"
+        let offDefaults = UserDefaults(suiteName: offSuite)!
+        defer { offDefaults.removePersistentDomain(forName: offSuite) }
+        let offSettings = AppSettings(mountPath: mountPath, openFinderAfterMount: false, infusePort: try freePort(), automaticUpdateCheck: false)
+        offDefaults.set(try JSONEncoder().encode(offSettings), forKey: "QuarkFS.settings.v1")
+        let offStub = StubUpdateTransport(tag: "v1.4.0")
+        var offNow = Date(timeIntervalSince1970: 1_765_000_000)
+        let offModel = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: offDefaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { offNow },
+            updateReevaluationInterval: 1,
+            wakeGracePeriod: 0.05,
+            openURL: { _ in },
+            updateTransport: offStub.makeTransport()
+        )
+        do {
+            await offModel.bootstrap()
+            offModel.handleSystemWake()
+            offNow = offNow.addingTimeInterval(120)
+            await offModel.checkForUpdatesAutomaticallyIfDue()
+            try? await Task.sleep(for: .milliseconds(200))
+            try require(offStub.callCount == 0,
+                        "with automaticUpdateCheck off, no automatic request runs at launch, wake, or tick")
+            // Turning the switch on with a stale/missing lastCheck triggers a check promptly (C4).
+            offModel.settings.automaticUpdateCheck = true
+            await offModel.persistSettings()
+            try require(await waitUntil { offStub.callCount == 1 },
+                        "turning automaticUpdateCheck on with a stale lastCheck evaluates promptly")
+            try require(await offModel.shutdownNow(), "switch-off model shuts down cleanly")
+        } catch {
+            _ = await offModel.shutdownNow()
+            throw error
+        }
+
+        // Wake grace period & offline automatic retry without tight loop (C1).
+        let wakeSuite = suite + ".updates-wake"
+        let wakeDefaults = UserDefaults(suiteName: wakeSuite)!
+        defer { wakeDefaults.removePersistentDomain(forName: wakeSuite) }
+        var wakeNow = Date(timeIntervalSince1970: 1_766_000_000)
+        let staleRecord = UpdateRecord(lastCheck: wakeNow.addingTimeInterval(-25 * 60 * 60))
+        wakeDefaults.set(try JSONEncoder().encode(staleRecord), forKey: "QuarkFS.update.v1")
+        let wakeStub = StubUpdateTransport(tag: "v1.5.0")
+        wakeStub.setFailOffline(true)
+        let wakeModel = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: wakeDefaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { wakeNow },
+            wakeGracePeriod: 60,
+            openURL: { _ in },
+            updateTransport: wakeStub.makeTransport()
+        )
+        // Wake fires while due: ticks inside the 60s grace period must make no request,
+        // while a manual check during the grace period runs immediately.
+        wakeModel.handleSystemWake()
+        wakeNow = wakeNow.addingTimeInterval(30)
+        await wakeModel.checkForUpdatesAutomaticallyIfDue()
+        try require(wakeStub.callCount == 0, "no automatic check runs inside the 60s post-wake grace period")
+        // Verify a separate due model lets a manual check run immediately inside the grace period.
+        let manualWakeSuite = suite + ".updates-wake-manual"
+        let manualWakeDefaults = UserDefaults(suiteName: manualWakeSuite)!
+        defer { manualWakeDefaults.removePersistentDomain(forName: manualWakeSuite) }
+        let manualWakeStub = StubUpdateTransport(tag: "v1.5.0")
+        let manualWakeModel = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: manualWakeDefaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            updateClock: { wakeNow },
+            wakeGracePeriod: 60,
+            openURL: { _ in },
+            updateTransport: manualWakeStub.makeTransport()
+        )
+        manualWakeModel.handleSystemWake()
+        await manualWakeModel.checkForUpdatesManually()
+        try require(manualWakeStub.callCount == 1 && manualWakeModel.availableUpdate?.version == "1.5.0",
+                    "manual check runs immediately even inside the post-wake grace period")
+        _ = await manualWakeModel.shutdownNow()
+
+        // Verify the delayed wake task itself fires automatically once the grace period elapses.
+        let delayedWakeSuite = suite + ".updates-wake-delayed"
+        let delayedWakeDefaults = UserDefaults(suiteName: delayedWakeSuite)!
+        defer { delayedWakeDefaults.removePersistentDomain(forName: delayedWakeSuite) }
+        let delayedWakeStub = StubUpdateTransport(tag: "v1.5.0")
+        let delayedWakeModel = AppModel(
+            credentialStore: TestCredentials(),
+            defaults: delayedWakeDefaults,
+            paths: paths,
+            runningVersion: "1.1.3",
+            wakeGracePeriod: 0.15,
+            openURL: { _ in },
+            updateTransport: delayedWakeStub.makeTransport()
+        )
+        delayedWakeModel.handleSystemWake()
+        try require(delayedWakeStub.callCount == 0, "delayed wake task does not fire before the grace period ends")
+        try require(await waitUntil { delayedWakeStub.callCount == 1 && delayedWakeModel.availableUpdate?.version == "1.5.0" },
+                    "delayed wake task fires automatically once the post-wake grace period ends")
+        _ = await delayedWakeModel.shutdownNow()
+
+        // Past the 60s grace period: automatic check runs and fails offline.
+        wakeNow = wakeNow.addingTimeInterval(35)
+        await wakeModel.checkForUpdatesAutomaticallyIfDue()
+        try require(wakeStub.callCount == 1 && wakeModel.updateResult == .couldNotCheck(.offline),
+                    "due automatic check runs once the post-wake grace period has passed")
+        // 10 minutes later: skipped (no tight retry loop).
+        wakeNow = wakeNow.addingTimeInterval(10 * 60)
+        await wakeModel.checkForUpdatesAutomaticallyIfDue()
+        try require(wakeStub.callCount == 1, "offline automatic failure does not retry in a tight loop")
+        // Next hourly tick: retries and succeeds when back online.
+        wakeStub.setRelease(tag: "v1.5.0")
+        wakeNow = wakeNow.addingTimeInterval(50 * 60)
+        await wakeModel.checkForUpdatesAutomaticallyIfDue()
+        try require(wakeStub.callCount == 2 && wakeModel.availableUpdate?.version == "1.5.0",
+                    "offline automatic failure retries at the next hourly tick instead of waiting 24h")
+        _ = await wakeModel.shutdownNow()
+    }
+
     @MainActor static func waitUntil(_ condition: () -> Bool) async -> Bool {
         for _ in 0..<80 {
             if condition() { return true }
@@ -540,6 +1055,10 @@ struct AppBehaviorChecks {
     }
 
     static func originalSafeMount(_ root: URL) -> String { root.appendingPathComponent("ConflictMount").path }
+
+    /// The literal identity the engine must send; kept here so a change to
+    /// the production value is a deliberate, reviewed test change.
+    static let quarkClientUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
 
     /// Mirrors EngineFixture.py `obscure -`.
     static func fixtureObscured(_ cookie: String) -> String {
