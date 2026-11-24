@@ -308,13 +308,14 @@ let roundtrip = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().e
 check(roundtrip == custom, "自定义连接设置应可持久化")
 check(AppSettings(infusePort: 0).infusePort == 8686, "无效端口不能传入引擎")
 
-// The runtime config must not carry a user_agent override, so the engine never
-// identifies as anything other than its own default client.
+// Quark refuses large files to the web page (code 23018); the engine must
+// identify as the PC client for the download link and the CDN transfer.
+let quarkPCUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
 let runtimeConfigText = try RuntimeConfiguration.text(obscuredCookie: "obscured-value")
 check(runtimeConfigText
-      == "[quark]\ntype = quark\ncookie = obscured-value\n",
-      "运行配置只能包含 quark 远端和登录信息，不得设置 user_agent")
-check(!runtimeConfigText.contains("user_agent"), "运行配置不得包含 user_agent")
+      == "[quark]\ntype = quark\ncookie = obscured-value\nuser_agent = \(quarkPCUserAgent)\n",
+      "运行配置必须包含 quark 远端、登录信息和夸克 PC 客户端标识")
+check(RuntimeConfiguration.quarkClientUserAgent == quarkPCUserAgent, "夸克 PC 客户端标识必须与预期一致")
 for invalid in ["", "line\nuser_agent = other", "with space"] {
     do {
         _ = try RuntimeConfiguration.text(obscuredCookie: invalid)
@@ -398,7 +399,29 @@ let configURL = paths.runtimeConfig
 try RuntimeConfiguration.write(obscuredCookie: "obscured-value", to: configURL)
 let configMode = (try FileManager.default.attributesOfItem(atPath: configURL.path)[.posixPermissions] as? NSNumber)?.intValue
 check(configMode == 0o600, "运行配置只能由当前用户读取")
+try RuntimeConfiguration.write(obscuredCookie: "second-obscured-value", to: configURL)
+let overwrittenMode = (try FileManager.default.attributesOfItem(atPath: configURL.path)[.posixPermissions] as? NSNumber)?.intValue
+let runtimeDirItems = try FileManager.default.contentsOfDirectory(atPath: paths.runtimeDirectory.path)
+check(overwrittenMode == 0o600 && runtimeDirItems == ["rclone.conf"],
+      "原子覆盖运行配置必须保持 0600 权限且不遗留临时文件")
+// A planted symlink at rclone.conf must be replaced atomically, never followed.
+let symlinkConfigTarget = outside.appendingPathComponent("runtime-config-target.txt")
+try Data("keep-external-config".utf8).write(to: symlinkConfigTarget)
 try FileManager.default.removeItem(at: configURL)
+try FileManager.default.createSymbolicLink(at: configURL, withDestinationURL: symlinkConfigTarget)
+try RuntimeConfiguration.write(obscuredCookie: "third-obscured-value", to: configURL)
+let replacedMode = (try FileManager.default.attributesOfItem(atPath: configURL.path)[.posixPermissions] as? NSNumber)?.intValue
+check((try? FileManager.default.destinationOfSymbolicLink(atPath: configURL.path)) == nil && replacedMode == 0o600,
+      "预埋在 rclone.conf 的符号链接必须被 0600 普通文件安全替换")
+let preservedTarget = try String(contentsOf: symlinkConfigTarget, encoding: .utf8)
+check(preservedTarget == "keep-external-config",
+      "写入运行配置不得沿着符号链接覆盖外部文件")
+// Leftover temp files from a crash must be cleaned alongside rclone.conf.
+let leftoverTemp = paths.runtimeDirectory.appendingPathComponent(".rclone-crash-leftover.tmp")
+try Data("leftover".utf8).write(to: leftoverTemp)
+RuntimeConfiguration.remove(at: configURL)
+check(!FileManager.default.fileExists(atPath: configURL.path) && !FileManager.default.fileExists(atPath: leftoverTemp.path),
+      "清理运行配置时必须一并删除遗留的 .rclone-*.tmp 临时文件")
 
 let validDAV = Data("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:propstat><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>".utf8)
 check(WebDAVHealth.evaluate(status: 207, data: validDAV) == .ready, "成功的 WebDAV 目录响应应通过检查")
@@ -437,4 +460,449 @@ do {
     // The upstream API also accepts status 0. It must reach the cookie check.
 }
 
-print("PASS: QuarkFS 核心回归测试全部通过（挂载、缓存边界、进程、登录、设置迁移、WebDAV）")
+// MARK: - Update check settings migration, SemVer precedence, HTTP hygiene, validation & schedule
+
+check(migrated.automaticUpdateCheck == true, "升级旧设置必须默认开启自动检查更新")
+let disabledAutoSettings = AppSettings(automaticUpdateCheck: false)
+let decodedDisabledAuto = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(disabledAutoSettings))
+check(decodedDisabledAuto.automaticUpdateCheck == false, "关闭自动检查更新的设置必须可持久化")
+
+enum VersionOrder { case less, equal, greater }
+let versionTable: [(String, VersionOrder, String)] = [
+    ("v1.1.3", .equal, "1.1.3"),
+    ("v1.1.3", .less, "1.2.0"),
+    ("1.1.3", .less, "v1.2.0"),
+    ("1.2", .equal, "1.2.0"),
+    ("1.2", .equal, "1.2.0.0"),
+    ("0", .equal, "0.0.0"),
+    ("1.2", .less, "1.2.1"),
+    ("1.2.0", .less, "1.2.0.1"),
+    ("1.2.9", .less, "1.2.10"),
+    ("1.9.9", .less, "1.10.0"),
+    ("1.10.0", .less, "2.0.0"),
+    ("1.0.0-alpha", .less, "1.0.0-alpha.1"),
+    ("1.0.0-alpha.1", .less, "1.0.0-alpha.beta"),
+    ("1.0.0-alpha.beta", .less, "1.0.0-beta"),
+    ("1.0.0-beta", .less, "1.0.0-beta.2"),
+    ("1.0.0-beta.2", .less, "1.0.0-beta.11"),
+    ("1.0.0-beta.11", .less, "1.0.0-rc.1"),
+    ("1.0.0-rc.1", .less, "1.0.0"),
+    ("1.0.0-1", .less, "1.0.0-alpha"),
+    ("1.0.0-2", .less, "1.0.0-11"),
+    ("1.0.0-0a", .less, "1.0.0-1a"),
+    ("1.0.0+001", .equal, "1.0.0"),
+    ("1.0.0-999999999999999999999", .less, "1.0.0-1000000000000000000000"),
+    ("1.2.0-rc.1", .less, "1.2"),
+    ("1.2.0+build.1", .equal, "1.2.0+build.2"),
+    ("1.2.0+20261124", .equal, "1.2.0"),
+    ("1.2.0-beta.1+exp.sha", .equal, "1.2.0-beta.1"),
+    ("v2.0.0", .greater, "1.99.99"),
+    ("1.2.0-rc.2", .greater, "1.2.0-rc.1"),
+    ("1.2.0-alpha.beta", .greater, "1.2.0-alpha.1")
+]
+check(versionTable.count >= 25, "版本比较表应至少覆盖 25 组用例")
+for (lhsText, order, rhsText) in versionTable {
+    guard let lhs = ReleaseVersion(lhsText), let rhs = ReleaseVersion(rhsText) else {
+        check(false, "合法版本号应能解析：\(lhsText) / \(rhsText)")
+        fatalError()
+    }
+    switch order {
+    case .less:
+        check(lhs < rhs && !(rhs < lhs) && lhs != rhs, "\(lhsText) 应小于 \(rhsText)")
+    case .equal:
+        check(lhs == rhs && !(lhs < rhs) && !(rhs < lhs), "\(lhsText) 应等于 \(rhsText)")
+    case .greater:
+        check(rhs < lhs && !(lhs < rhs) && lhs != rhs, "\(lhsText) 应大于 \(rhsText)")
+    }
+}
+check(ReleaseVersion("v1.2.0-rc.1+build.9")?.withoutBuildMetadata == "1.2.0-rc.1", "withoutBuildMetadata 应移除构建元数据")
+check(ReleaseVersion("v1.2.0")?.display == "1.2.0", "display 应去掉前导 v")
+
+let refusedVersions = [
+    "", "v", "V1.2.0", "1.2.", ".1.2", "1..2", "1.2.a", "1.2.0-", "1.2.0+",
+    "1.2.0-alpha..1", "1.2.0-alpha_1", "1.2.0+bad_meta", " 1.2.0", "1.2.0\n",
+    String(repeating: "1", count: 129), "99999999999999999999999999999.0.0",
+    "v1.2.0-beta!1", "1.2.0+build..1",
+    "01.2.3", "1.02.3", "1.2.03", "1.0.0-01", "1.0.0-00", "1.0.0-alpha.02"
+]
+for invalid in refusedVersions {
+    check(ReleaseVersion(invalid) == nil, "非法版本号必须被拒绝：\(invalid.debugDescription)")
+}
+
+// Release page validation: allowed repository paths and >= 15 refused addresses.
+let allowedReleasePages = [
+    "https://github.com/007xf/QuarkFS",
+    "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0",
+    "HTTPS://GITHUB.COM/007XF/QUARKFS/releases/tag/v1.2.0"
+]
+for validURL in allowedReleasePages {
+    check(UpdateChecker.validateReleasePage(validURL) != nil, "合法发行页面地址应允许：\(validURL)")
+}
+let refusedReleasePages = [
+    "https://evil.example/007xf/QuarkFS/releases/tag/v1.2.0",
+    "https://api.github.com/007xf/QuarkFS/releases/tag/v1.2.0",
+    "https://github.com.evil.example/007xf/QuarkFS",
+    "http://github.com/007xf/QuarkFS/releases/tag/v1.2.0",
+    "javascript:alert(1)",
+    "file:///Applications/QuarkFS.app",
+    "https://github.com/007xf/QuarkFS-evil/releases/tag/v1.2.0",
+    "https://github.com/007xf/Flayer/releases/tag/v1.2.0",
+    "https://user@github.com/007xf/QuarkFS/releases/tag/v1.2.0",
+    "https://user:pass@github.com/007xf/QuarkFS/releases/tag/v1.2.0",
+    "https://github.com:443/007xf/QuarkFS/releases/tag/v1.2.0",
+    "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0?download=1",
+    "https://github.com/007xf/QuarkFS?",
+    "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0#top",
+    "https://github.com/007xf/QuarkFS/../other",
+    "https://github.com/007xf/QuarkFS/./releases",
+    "https://github.com/007xf/QuarkFS/%2e%2e/other",
+    "https://github.com/007xf/QuarkFS/releases%2f..",
+    "https://github.com/007xf/QuarkFS/releases%5cevil",
+    "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0%0a",
+    "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0\n",
+    "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0%252f",
+    "https://github.com/007xf/QuarkFS//evil.com",
+    "https://github.com/007xf/QuarkFS/releases//x",
+    "https://github.com/007xf/QuarkFS/",
+    "https://git%68ub.com/007xf/QuarkFS",
+    "https://github.com:/007xf/QuarkFS",
+    "https://github.com/007xf/QuarkFS/releases/tag/" + String(repeating: "a", count: 2_050)
+]
+check(refusedReleasePages.count >= 15, "发行页面拒绝列表应至少覆盖 15 个非法地址")
+for badURL in refusedReleasePages {
+    check(UpdateChecker.validateReleasePage(badURL) == nil, "非法发行页面地址必须被拒绝：\(badURL.debugDescription)")
+}
+
+// Notes cleaning & scalar cap.
+let dirtyNotes = "第一行\r\n\t缩进\u{0000}\u{0007}\u{001B}[31m正常\u{007F}"
+check(UpdateChecker.cleanNotes(dirtyNotes) == "第一行\n\t缩进[31m正常", "更新说明必须移除换行与制表符之外的控制字符")
+let longNotes = String(repeating: "更", count: 1_500)
+let cleanedLong = UpdateChecker.cleanNotes(longNotes)
+check(cleanedLong.unicodeScalars.count == 1_200, "更新说明必须截断到最多 1200 个标量")
+check(UpdateChecker.cleanNotes(nil) == "", "空更新说明应返回空字符串")
+
+// Payload parsing checks.
+let validPayloadJSON = Data("""
+{
+  "tag_name": "v1.2.0",
+  "html_url": "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0",
+  "published_at": "2026-11-24T10:00:00Z",
+  "body": "新增更新检查\\r\\n\\t仅提示不自动下载\\u0007"
+}
+""".utf8)
+let parsedRelease = try UpdateChecker.parseRelease(validPayloadJSON)
+check(parsedRelease.version == "1.2.0"
+      && parsedRelease.pageURL.absoluteString == "https://github.com/007xf/QuarkFS/releases/tag/v1.2.0"
+      && parsedRelease.notes == "新增更新检查\n\t仅提示不自动下载",
+      "合法发行版 JSON 必须正确解析并清理更新说明")
+for badJSON in [
+    Data("not json".utf8),
+    Data("{\"tag_name\":\"bad\",\"html_url\":\"https://github.com/007xf/QuarkFS/releases/tag/v1.2.0\",\"published_at\":\"2026-11-24T10:00:00Z\"}".utf8),
+    Data("{\"tag_name\":\"v1.2.0\",\"html_url\":\"https://evil.example/007xf/QuarkFS\",\"published_at\":\"2026-11-24T10:00:00Z\"}".utf8),
+    Data("{\"tag_name\":\"v1.2.0\",\"html_url\":\"https://github.com/007xf/QuarkFS\",\"published_at\":\"not-a-date\"}".utf8)
+] {
+    do {
+        _ = try UpdateChecker.parseRelease(badJSON)
+        check(false, "损坏或非法发行页面地址的响应必须失败")
+    } catch UpdateChecker.Failure.invalidResponse {}
+}
+
+// Hardened URLSession configuration checks.
+let hardenedConfig = UpdateChecker.hardenedConfiguration(from: .ephemeral)
+check(hardenedConfig.httpCookieStorage == nil && !hardenedConfig.httpShouldSetCookies
+      && hardenedConfig.httpCookieAcceptPolicy == .never
+      && hardenedConfig.urlCache == nil && hardenedConfig.urlCredentialStorage == nil
+      && hardenedConfig.httpAdditionalHeaders == nil
+      && hardenedConfig.requestCachePolicy == .reloadIgnoringLocalCacheData
+      && hardenedConfig.timeoutIntervalForRequest == 15
+      && hardenedConfig.timeoutIntervalForResource == 30,
+      "更新检查会话必须关闭 Cookie、缓存与凭据存储，并设置 15s/30s 超时")
+
+// End-to-end HTTP transport checks via URLProtocol (headers, status mapping, body cap, redirect refusal).
+let updateURLConfig = URLSessionConfiguration.ephemeral
+updateURLConfig.protocolClasses = [UpdateStubProtocol.self]
+let protocolTransport = UpdateChecker.transport(configuration: updateURLConfig)
+
+@MainActor func makeProtocolChecker(runningVersion: String? = "1.1.3") -> UpdateChecker {
+    UpdateChecker(
+        runningVersion: runningVersion,
+        readSchedule: { .init(automaticEnabled: true, lastCheck: nil, lastAnnouncedVersion: nil) },
+        recordCheck: { _ in },
+        recordAnnouncement: { _ in },
+        transport: protocolTransport
+    )
+}
+
+UpdateStubProtocol.configure { _ in
+    .response(statusCode: 200, headers: ["Content-Type": "application/json"], chunks: [validPayloadJSON])
+}
+let newerResult = await makeProtocolChecker(runningVersion: "1.1.3").checkManually()
+check(newerResult == .newerAvailable(parsedRelease) && newerResult.message == "发现新版本 1.2.0",
+      "检测到更高版本应返回 newerAvailable")
+check(UpdateStubProtocol.capturedRequests.count == 1, "单次手动检查应发送一次请求")
+if let sent = UpdateStubProtocol.capturedRequests.first {
+    check(sent.httpMethod == "GET" && sent.url == UpdateChecker.endpoint, "请求必须 GET 官方 latest API")
+    check(sent.timeoutInterval == 15, "URLRequest 自身超时也必须为 15 秒")
+    check(sent.value(forHTTPHeaderField: "User-Agent") == "QuarkFS/1.1.3", "User-Agent 必须只包含 QuarkFS/<version>")
+    check(sent.value(forHTTPHeaderField: "Accept") == "application/vnd.github+json", "Accept 必须为 GitHub JSON")
+    check(sent.value(forHTTPHeaderField: "Accept-Language") == "*", "Accept-Language 必须为 *")
+    check(sent.httpShouldHandleCookies == false, "请求必须禁用 Cookie")
+    check(sent.value(forHTTPHeaderField: "Cookie") == nil && sent.value(forHTTPHeaderField: "Authorization") == nil,
+          "请求不得携带 Cookie 或认证头")
+}
+
+// Same or older release -> upToDate.
+UpdateStubProtocol.configure { _ in
+    .response(statusCode: 200, headers: ["Content-Type": "application/json"], chunks: [validPayloadJSON])
+}
+let upToDateResult = await makeProtocolChecker(runningVersion: "1.2.0").checkManually()
+check(upToDateResult == .upToDate && upToDateResult.message == "已是最新版本", "同版本或更高运行版本应返回已是最新版本")
+let newerRunningResult = await makeProtocolChecker(runningVersion: "1.3.0").checkManually()
+check(newerRunningResult == .upToDate, "高于远端的运行版本应返回已是最新版本")
+
+// Every failure status mapping & exact Chinese message.
+let statusCases: [(Int, [String: String], UpdateChecker.Failure, String)] = [
+    (404, [:], .noPublicRelease, "未找到 QuarkFS 的公开发行版"),
+    (429, [:], .rateLimited, "更新检查请求过于频繁，请稍后再试"),
+    (403, ["X-RateLimit-Remaining": "0"], .rateLimited, "更新检查请求过于频繁，请稍后再试"),
+    (403, ["Retry-After": "120"], .rateLimited, "更新检查请求过于频繁，请稍后再试"),
+    (403, ["X-RateLimit-Remaining": "59"], .repositoryUnavailable, "暂时无法访问 QuarkFS 的发行仓库"),
+    (500, [:], .repositoryUnavailable, "暂时无法访问 QuarkFS 的发行仓库"),
+    (503, [:], .repositoryUnavailable, "暂时无法访问 QuarkFS 的发行仓库")
+]
+for (code, headers, expectedFailure, expectedMessage) in statusCases {
+    UpdateStubProtocol.configure { _ in .response(statusCode: code, headers: headers, chunks: [Data("{}".utf8)]) }
+    let result = await makeProtocolChecker().checkManually()
+    check(result == .couldNotCheck(expectedFailure) && result.message == expectedMessage,
+          "HTTP \(code) \(headers) 应映射为 \(expectedFailure)：实际 \(result)")
+}
+
+// Offline error.
+UpdateStubProtocol.configure { _ in .error(URLError(.notConnectedToInternet)) }
+let offlineResult = await makeProtocolChecker().checkManually()
+check(offlineResult == .couldNotCheck(.offline) && offlineResult.message == "网络连接失败", "网络断开应返回离线失败")
+
+// Unreadable JSON.
+UpdateStubProtocol.configure { _ in .response(statusCode: 200, headers: [:], chunks: [Data("{bad".utf8)]) }
+let unreadableResult = await makeProtocolChecker().checkManually()
+check(unreadableResult == .couldNotCheck(.invalidResponse) && unreadableResult.message == "服务器返回了无法识别的响应",
+      "无法解析的 JSON 应返回 invalidResponse")
+
+// Invalid running version.
+let invalidRunningResult = await makeProtocolChecker(runningVersion: "not-a-version").checkManually()
+check(invalidRunningResult == .couldNotCheck(.invalidRunningVersion)
+      && invalidRunningResult.message == "无法识别当前 QuarkFS 的版本",
+      "无法识别当前版本应返回 invalidRunningVersion")
+
+// Redirect refused without following the target.
+UpdateStubProtocol.configure { _ in .redirect(to: URL(string: "https://evil.example/redirected")!) }
+let redirectResult = await makeProtocolChecker().checkManually()
+check(redirectResult == .couldNotCheck(.repositoryUnavailable), "重定向必须被拒绝")
+check(UpdateStubProtocol.capturedRequests.count == 1, "重定向后不得发起第二个请求")
+
+// Body larger than 256 KB cap: both Content-Length header and streamed chunks.
+UpdateStubProtocol.configure { _ in
+    .response(statusCode: 200, headers: ["Content-Length": "\(UpdateChecker.maximumResponseBytes + 1)"], chunks: [Data(repeating: 0x41, count: 1024)])
+}
+let headerTooLarge = await makeProtocolChecker().checkManually()
+check(headerTooLarge == .couldNotCheck(.responseTooLarge) && headerTooLarge.message == "下载内容超过允许的大小",
+      "超过 256 KB 的 Content-Length 必须直接拒绝")
+
+let chunk64K = Data(repeating: 0x41, count: 64 * 1024)
+let gatedProtocolTransport = UpdateChecker.transport(
+    configuration: updateURLConfig,
+    onChunkAccepted: { UpdateStubProtocol.releaseNextChunk() }
+)
+@MainActor func makeGatedProtocolChecker() -> UpdateChecker {
+    UpdateChecker(
+        runningVersion: "1.1.3",
+        readSchedule: { .init(automaticEnabled: true, lastCheck: nil, lastAnnouncedVersion: nil) },
+        recordCheck: { _ in },
+        recordAnnouncement: { _ in },
+        transport: gatedProtocolTransport
+    )
+}
+UpdateStubProtocol.configure { _ in
+    // 12 chunks = 768 KB > 256 KB; gate-driven so chunk N+1 is only sent after
+    // chunk N is accepted, deterministically stopping on chunk 5 with no timing.
+    .gatedStream(statusCode: 200, headers: [:], chunks: Array(repeating: chunk64K, count: 12))
+}
+let streamedTooLarge = await makeGatedProtocolChecker().checkManually()
+check(streamedTooLarge == .couldNotCheck(.responseTooLarge) && streamedTooLarge.message == "下载内容超过允许的大小",
+      "流式响应超过 256 KB 必须中止读取并失败")
+check(UpdateStubProtocol.chunksSentBeforeStop == 5,
+      "流式响应超限时必须在第 5 块提前停止读取，不能读完整个响应（实际读取块数：\(UpdateStubProtocol.chunksSentBeforeStop)）")
+
+// Schedule, interval, announcement once-per-version, and concurrent request sharing.
+final class ScheduleTransportStub: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var payload: Data
+    private var failOffline = false
+
+    init(payload: Data) {
+        self.payload = payload
+    }
+
+    var requestCount: Int { lock.withLock { count } }
+
+    func setPayload(_ data: Data) { lock.withLock { payload = data } }
+    func setFailOffline(_ flag: Bool) { lock.withLock { failOffline = flag } }
+
+    func respond() throws -> UpdateChecker.HTTPResponse {
+        try lock.withLock {
+            count += 1
+            if failOffline { throw UpdateChecker.Failure.offline }
+            return UpdateChecker.HTTPResponse(statusCode: 200, data: payload)
+        }
+    }
+}
+
+@MainActor func runScheduleAndConcurrencyChecks() async {
+    var now = Date(timeIntervalSince1970: 1_764_000_000)
+    var schedule = UpdateChecker.Schedule(automaticEnabled: true, lastCheck: nil, lastAnnouncedVersion: nil)
+    let stub = ScheduleTransportStub(payload: validPayloadJSON)
+
+    let checker = UpdateChecker(
+        runningVersion: "1.1.3",
+        readSchedule: { schedule },
+        recordCheck: {
+            schedule.lastCheck = $0
+            schedule.lastOfflineAutomaticAttempt = nil
+            schedule.offlineAutomaticRetryCount = 0
+        },
+        recordOfflineAutomaticAttempt: { date, count in
+            schedule.lastOfflineAutomaticAttempt = date
+            schedule.offlineAutomaticRetryCount = count
+        },
+        recordAnnouncement: { schedule.lastAnnouncedVersion = $0 },
+        clock: { now },
+        transport: { _, _ in try stub.respond() }
+    )
+
+    // Switch off -> no automatic request.
+    schedule.automaticEnabled = false
+    let skippedOff = await checker.checkAutomaticallyIfDue()
+    check(skippedOff == nil && stub.requestCount == 0, "关闭自动检查时不得发送自动请求")
+
+    // Manual bypasses switch off.
+    stub.setFailOffline(true)
+    let manualFailed = await checker.checkManually()
+    check(manualFailed == .couldNotCheck(.offline) && stub.requestCount == 1 && schedule.lastCheck == now,
+          "手动检查必须忽略开关并记录检查时间")
+
+    // Re-enable switch: failed check already started the 24h interval.
+    schedule.automaticEnabled = true
+    stub.setFailOffline(false)
+    now = now.addingTimeInterval(24 * 60 * 60 - 1)
+    let notDueYet = await checker.checkAutomaticallyIfDue()
+    check(notDueYet == nil && stub.requestCount == 1, "失败的检查也必须开始 24 小时间隔")
+
+    // At 24h: due -> finds 1.2.0 and prepares one automatic notice.
+    now = now.addingTimeInterval(1)
+    let autoFound = await checker.checkAutomaticallyIfDue()
+    check(autoFound == .newerAvailable(parsedRelease) && stub.requestCount == 2, "满 24 小时后自动检查必须执行")
+    let firstNotice = checker.takeAutomaticNotice()
+    check(firstNotice?.version == "1.2.0" && schedule.lastAnnouncedVersion == "1.2.0", "自动发现的新版本应提示一次并记住版本号")
+    check(checker.takeAutomaticNotice() == nil, "同一提示被消费后不得重复返回")
+
+    // Another 24h later: same version (even with different build metadata) is not announced again.
+    now = now.addingTimeInterval(24 * 60 * 60)
+    stub.setPayload(Data("""
+    {"tag_name":"v1.2.0+build.2","html_url":"https://github.com/007xf/QuarkFS/releases/tag/v1.2.0","published_at":"2026-11-24T10:00:00Z","body":"notes"}
+    """.utf8))
+    let autoRepeat = await checker.checkAutomaticallyIfDue()
+    check(autoRepeat != nil && checker.takeAutomaticNotice() == nil, "已提示过的版本不得再次自动提示")
+
+    // Newer version 1.3.0 after announced 1.2.0 IS announced again.
+    now = now.addingTimeInterval(24 * 60 * 60)
+    stub.setPayload(Data("""
+    {"tag_name":"v1.3.0","html_url":"https://github.com/007xf/QuarkFS/releases/tag/v1.3.0","published_at":"2026-11-26T10:00:00Z","body":"1.3"}
+    """.utf8))
+    _ = await checker.checkAutomaticallyIfDue()
+    let secondNotice = checker.takeAutomaticNotice()
+    check(secondNotice?.version == "1.3.0" && schedule.lastAnnouncedVersion == "1.3.0", "更高的版本必须再次自动提示")
+
+    // Manual check discovering 1.4.0 counts as announcement -> later automatic check does not announce 1.4.0.
+    stub.setPayload(Data("""
+    {"tag_name":"v1.4.0","html_url":"https://github.com/007xf/QuarkFS/releases/tag/v1.4.0","published_at":"2026-11-27T10:00:00Z","body":"1.4"}
+    """.utf8))
+    let manualNewer = await checker.checkManually()
+    if case .newerAvailable(let release14) = manualNewer {
+        check(release14.version == "1.4.0" && schedule.lastAnnouncedVersion == "1.4.0", "手动检查报告新版本应记为已提示")
+    } else {
+        check(false, "手动检查应报告 1.4.0")
+    }
+    now = now.addingTimeInterval(24 * 60 * 60)
+    _ = await checker.checkAutomaticallyIfDue()
+    check(checker.takeAutomaticNotice() == nil, "手动检查报告过的版本不得再次自动提示")
+
+    // Future lastCheck (wrong clock jumped back) must be treated as due (C2).
+    schedule.lastCheck = now.addingTimeInterval(10 * 24 * 60 * 60)
+    let beforeFutureCheck = stub.requestCount
+    let futureDue = await checker.checkAutomaticallyIfDue()
+    check(futureDue != nil && stub.requestCount == beforeFutureCheck + 1 && schedule.lastCheck == now,
+          "上次检查时间晚于当前时间时必须立即视为到期")
+
+    // Automatic offline failure retries at the next hourly tick without a tight
+    // loop, caps retries per day, and then starts the 24h interval (C1).
+    now = now.addingTimeInterval(24 * 60 * 60)
+    stub.setFailOffline(true)
+    let offlineStartCalls = stub.requestCount
+    let offline1 = await checker.checkAutomaticallyIfDue()
+    check(offline1 == .couldNotCheck(.offline) && stub.requestCount == offlineStartCalls + 1
+          && schedule.offlineAutomaticRetryCount == 1,
+          "首次离线自动检查失败应记录离线重试次数而非锁死 24 小时")
+    // 10 minutes later: skipped (no tight retry loop).
+    now = now.addingTimeInterval(10 * 60)
+    let tightSkip = await checker.checkAutomaticallyIfDue()
+    check(tightSkip == nil && stub.requestCount == offlineStartCalls + 1, "离线重试冷却期内不得高频重试")
+    // 1 hour after attempt 1: retry #2 runs.
+    now = now.addingTimeInterval(50 * 60)
+    let offline2 = await checker.checkAutomaticallyIfDue()
+    check(offline2 == .couldNotCheck(.offline) && stub.requestCount == offlineStartCalls + 2
+          && schedule.offlineAutomaticRetryCount == 2,
+          "离线自动检查失败满 1 小时后应重试")
+    // 1 hour after attempt 2: retry #3 hits cap and enters 24h cooldown.
+    now = now.addingTimeInterval(60 * 60)
+    let offline3 = await checker.checkAutomaticallyIfDue()
+    check(offline3 == .couldNotCheck(.offline) && stub.requestCount == offlineStartCalls + 3
+          && schedule.offlineAutomaticRetryCount == 0 && schedule.lastCheck == now,
+          "达到每日离线重试上限后应进入 24 小时间隔")
+    now = now.addingTimeInterval(60 * 60)
+    let cappedSkip = await checker.checkAutomaticallyIfDue()
+    check(cappedSkip == nil && stub.requestCount == offlineStartCalls + 3,
+          "超过离线重试上限后 1 小时内不得继续重试")
+    stub.setFailOffline(false)
+
+    // Concurrent callers share one in-flight request.
+    final class ConcurrentGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        var callCount: Int { lock.withLock { count } }
+        private func recordCall() { lock.withLock { count += 1 } }
+        func enter() async -> UpdateChecker.HTTPResponse {
+            recordCall()
+            try? await Task.sleep(for: .milliseconds(120))
+            return UpdateChecker.HTTPResponse(statusCode: 200, data: validPayloadJSON)
+        }
+    }
+    let gate = ConcurrentGate()
+    let sharedChecker = UpdateChecker(
+        runningVersion: "1.1.3",
+        readSchedule: { .init(automaticEnabled: true, lastCheck: nil, lastAnnouncedVersion: nil) },
+        recordCheck: { _ in },
+        recordAnnouncement: { _ in },
+        transport: { _, _ in await gate.enter() }
+    )
+    async let firstCall = sharedChecker.checkManually()
+    async let secondCall = sharedChecker.checkManually()
+    let (r1, r2) = await (firstCall, secondCall)
+    check(gate.callCount == 1 && r1 == r2 && r1 == .newerAvailable(parsedRelease),
+          "并发的两次更新检查必须共享同一次请求")
+}
+await runScheduleAndConcurrencyChecks()
+check(UpdateChecker.liveTransportConstructionCount == 0 && UpdateChecker.liveTransportCallCount == 0,
+      "冒烟测试期间不得构造或调用真实更新网络传输")
+
+print("PASS: QuarkFS 核心回归测试全部通过（挂载、缓存边界、进程、登录、设置迁移、WebDAV、更新检查）")

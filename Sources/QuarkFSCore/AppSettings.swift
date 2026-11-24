@@ -54,6 +54,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var cleanupDelaySeconds: Int
     public var openFinderAfterMount: Bool
     public var infusePort: Int
+    public var automaticUpdateCheck: Bool
 
     public init(
         mountPath: String = FileManager.default.homeDirectoryForCurrentUser
@@ -62,7 +63,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
         autoCleanup: Bool = true,
         cleanupDelaySeconds: Int = 60,
         openFinderAfterMount: Bool = true,
-        infusePort: Int = 8686
+        infusePort: Int = 8686,
+        automaticUpdateCheck: Bool = true
     ) {
         self.mountPath = mountPath
         self.profile = profile
@@ -70,10 +72,11 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.cleanupDelaySeconds = cleanupDelaySeconds
         self.openFinderAfterMount = openFinderAfterMount
         self.infusePort = (1024...65535).contains(infusePort) ? infusePort : 8686
+        self.automaticUpdateCheck = automaticUpdateCheck
     }
 
     private enum CodingKeys: String, CodingKey {
-        case mountPath, profile, autoCleanup, cleanupDelaySeconds, openFinderAfterMount, infusePort
+        case mountPath, profile, autoCleanup, cleanupDelaySeconds, openFinderAfterMount, infusePort, automaticUpdateCheck
     }
 
     public init(from decoder: Decoder) throws {
@@ -85,7 +88,8 @@ public struct AppSettings: Codable, Equatable, Sendable {
             autoCleanup: try values.decodeIfPresent(Bool.self, forKey: .autoCleanup) ?? defaults.autoCleanup,
             cleanupDelaySeconds: min(600, max(15, try values.decodeIfPresent(Int.self, forKey: .cleanupDelaySeconds) ?? 60)),
             openFinderAfterMount: try values.decodeIfPresent(Bool.self, forKey: .openFinderAfterMount) ?? true,
-            infusePort: try values.decodeIfPresent(Int.self, forKey: .infusePort) ?? 8686
+            infusePort: try values.decodeIfPresent(Int.self, forKey: .infusePort) ?? 8686,
+            automaticUpdateCheck: try values.decodeIfPresent(Bool.self, forKey: .automaticUpdateCheck) ?? true
         )
     }
 }

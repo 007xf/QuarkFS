@@ -8,20 +8,39 @@ struct ContentView: View {
     @State private var showingComponents = false
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 18) {
-                header
-                if case .failed(let message) = model.status {
-                    warning(message)
+        ScrollViewReader { scrollProxy in
+            ScrollView {
+                VStack(spacing: 18) {
+                    header
+                    if case .failed(let message) = model.status {
+                        warning(message)
+                    }
+                    if let release = model.automaticUpdateBanner {
+                        updateBanner(release)
+                    }
+                    connectionCard
+                    if model.preflight.needsSetup || showingComponents {
+                        setupCard
+                    }
+                    cacheCard
+                    updateCard
+                        .id("update-card")
+                    activityCard
                 }
-                connectionCard
-                if model.preflight.needsSetup || showingComponents {
-                    setupCard
-                }
-                cacheCard
-                activityCard
+                .padding(24)
             }
-            .padding(24)
+            .onAppear {
+                if model.consumeUpdateCardFocus() {
+                    scrollProxy.scrollTo("update-card", anchor: .center)
+                }
+            }
+            .onChange(of: model.pendingUpdateCardFocus) { _, pending in
+                if pending, model.consumeUpdateCardFocus() {
+                    withAnimation {
+                        scrollProxy.scrollTo("update-card", anchor: .center)
+                    }
+                }
+            }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minWidth: 720, minHeight: 560)
@@ -285,6 +304,161 @@ struct ContentView: View {
         }
     }
 
+    var updateCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 12) {
+                    updateStatusView
+                    Spacer(minLength: 12)
+                    HStack(spacing: 8) {
+                        if let release = model.availableUpdate {
+                            Button("查看发行页面") {
+                                model.openReleasePage(release)
+                            }
+                        }
+                        Button("检查更新") {
+                            Task { await model.checkForUpdatesManually() }
+                        }
+                        .disabled(model.isCheckingForUpdates)
+                    }
+                }
+
+                if let release = model.availableUpdate {
+                    let trimmedNotes = release.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmedNotes.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("更新说明")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Text(verbatim: trimmedNotes)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .lineLimit(8)
+                                .truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+
+                Divider()
+
+                Toggle("自动检查更新", isOn: $model.settings.automaticUpdateCheck)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(Self.lastCheckCaption(model.lastUpdateCheck))
+                    Text("检查时只访问 GitHub 上的公开发行信息，不发送账号和文件信息。")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(6)
+        } label: {
+            Label("版本与更新", systemImage: "arrow.down.circle")
+        }
+    }
+
+    @ViewBuilder
+    private var updateStatusView: some View {
+        HStack(alignment: .center, spacing: 8) {
+            if model.isCheckingForUpdates {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在检查更新")
+                    .font(.headline)
+            } else if let result = model.updateResult {
+                switch result {
+                case .upToDate:
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("已是最新版本")
+                            .font(.headline)
+                        Text("当前版本 \(model.displayVersion)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                case .newerAvailable(let release):
+                    Image(systemName: "arrow.down.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("发现新版本 \(release.version)")
+                            .font(.headline)
+                        Text("发布于 \(Self.releaseDateString(release.publishedAt))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                case .couldNotCheck(.noPublicRelease):
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("无法检查更新")
+                            .font(.headline)
+                        Text(result.message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                case .couldNotCheck(let failure):
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("无法检查更新")
+                            .font(.headline)
+                        Text(failure.message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            } else {
+                Text("QuarkFS \(model.displayVersion)")
+                    .font(.headline)
+            }
+        }
+        .frame(minHeight: 36, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func updateBanner(_ release: UpdateChecker.Release) -> some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.circle")
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
+                Text("QuarkFS \(release.version) 已发布")
+            }
+            .accessibilityElement(children: .combine)
+            Spacer()
+            Button("查看发行页面") {
+                model.openReleasePage(release)
+            }
+            Button {
+                model.dismissAutomaticUpdateBanner()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("关闭")
+            .help("关闭")
+        }
+        .padding(12)
+        .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+    }
+
     private var activityCard: some View {
         GroupBox {
             ScrollView {
@@ -364,6 +538,23 @@ struct ContentView: View {
             return "当前引擎缺少本地磁盘挂载功能，请重新安装 QuarkFS"
         }
         return model.preflight.engine.version ?? model.preflight.engine.problem ?? "未找到"
+    }
+
+    private static func releaseDateString(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter.string(from: date)
+    }
+
+    private static func lastCheckCaption(_ date: Date?) -> String {
+        guard let date else { return "尚未检查" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return "上次检查：\(formatter.string(from: date))"
     }
 }
 

@@ -18,6 +18,7 @@ done
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
   -I "$BIN_DIR/Modules" -I "$BIN_DIR" \
   Sources/QuarkFS/AppModel.swift Sources/QuarkFS/ShortcutPreferences.swift \
+  Sources/QuarkFS/MenuBarGlyph.swift \
   Tests/QuarkFSCoreTests/AppBehaviorChecks.swift \
   "${CORE_OBJECTS[@]}" \
   -o "$BIN_DIR/QuarkFSBehaviorTests"

@@ -9,13 +9,42 @@ Finder / other local-file apps ──► macFUSE mount ──► bundled rclone 
 Infuse ─────────────────────────► read-only WebDAV on 127.0.0.1:8686 ──► same engine ──► Quark
 ```
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/window-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/window-light.png">
+  <img alt="QuarkFS main window showing the Finder disk mounted at /Users/you/Quark and the local Infuse WebDAV connection ready on 127.0.0.1:8686" src="docs/images/window-light.png" width="780">
+</picture>
+
+_Main window with the Finder disk mounted and the local Infuse connection ready. The app interface shown in the pictures is in Simplified Chinese; the Chinese labels are given in parentheses below where you need to find a button._
+
 The second path exists because Infuse does not accept a macFUSE folder as a media source. The WebDAV server binds to the loopback address only, so it is not reachable from the local network. It requires a user name and a password generated on this Mac, so other users, sandboxed apps and web pages cannot read it anonymously. QuarkFS stops the bridge process when it quits, and stops a leftover bridge the next time it starts after a crash.
 
 > **Security notice:** versions 1.0.0 to 1.1.2 served the local WebDAV without authentication. Upgrade to 1.1.3 or later. See [GHSA-vv59-62m4-xmr6](https://github.com/007xf/QuarkFS/security/advisories/GHSA-vv59-62m4-xmr6).
 
+## What's new in 1.2.0
+
+- **Large files are readable again.** The engine identifies itself to Quark as the Quark desktop client (`user_agent` in the runtime configuration). This uses your own login and reads only your own files; it does not involve or unlock any paid membership features. Quark may change or restrict this at any time (see [Large files](#large-files)).
+- **Check for updates.** QuarkFS can check GitHub's public release metadata for this repository automatically (at most once every 24 hours, enabled by default and toggleable in the "Version & updates" card) or on demand from the window, menu bar or app menu. It only reports newer versions and opens the official release page; it never downloads or installs updates automatically.
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/update-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/update-light.png">
+    <img alt="Version & updates card showing a newer 1.2.0 release found, release notes, and a button to open the release page" src="docs/images/update-light.png" width="780">
+  </picture>
+
+- **New menu-bar glyph.** The status-bar icon is now a monochrome template glyph (cloud, stream and drive) whose shape indicates the current state—not mounted, mounting/unmounting, mounted, or needs attention—without relying on colour.
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/menubar-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/menubar-light.png">
+    <img alt="Illustration of the four menu-bar glyph states: Not mounted, Mounting / Unmounting, Mounted, and Needs attention" src="docs/images/menubar-light.png" width="780">
+  </picture>
+
+  _Illustration of the four menu-bar glyph states enlarged to show their shapes (not a screenshot of a real macOS menu bar)._
+
 ## Features
 
-- Menu-bar app using the native macOS `atom` symbol.
+- Menu-bar app with a monochrome template glyph (cloud, stream and drive) whose shape changes for idle, mounting/unmounting, mounted and needs-attention states without relying on colour.
 - Read-only macFUSE mount, at `~/Quark` by default.
 - Read-only local WebDAV that starts automatically, at `http://127.0.0.1:8686` by default. It can be started and stopped on its own, the port can be changed, and there are buttons to copy the connection details and to open Infuse.
 - A connection shows "Ready" only after a real WebDAV directory check passes. A busy port or a failed login is reported as an error. During playback, a download refused by Quark (for example code 23018, the download size limit), an expired login or repeated read failures are shown in the connection area, the menu bar and the activity log.
@@ -23,11 +52,10 @@ The second path exists because Infuse does not accept a macFUSE folder as a medi
 - "First-time setup" is shown only while a component or the account is not ready, and hides once everything is fine. "Components & account" in the top-right corner opens it again, and is where you log out.
 - Log in by scanning a QR code or by pasting a Cookie. The login is stored only in the macOS Keychain, never in the repository or in a plain-text configuration file.
 - Three cache policies, "No residue", "Balanced" and "High performance", plus a dedicated cache cleaner.
+- Optional update check (notice only, never an automatic download or install): checks GitHub's public release metadata for this repository at most once every 24 hours when enabled, or on demand from the "Version & updates" (版本与更新) card, menu bar or app menu.
 - Default shortcuts: `⌥⌘O` show window, `⌥⌘E` mount/unmount, `⌥⌘F` open in Finder, `⌥⌘R` re-check, `⌥⌘K` clear cache.
 - A shortcut recorder: click the field and press the keys. Esc cancels, Delete clears, and a combination already in use is refused.
 - The app and the bundled engine are built for Apple Silicon (arm64).
-
-The app's interface is in Simplified Chinese. The Chinese labels are given in parentheses below where you need to find a button.
 
 ## Quick start
 
@@ -80,7 +108,9 @@ If Infuse shows no folders, check that "Infuse local connection" in QuarkFS says
 
 ### Large files
 
-Quark refuses to serve large files through this download interface (code 23018, "download file size limit"). QuarkFS reports this with the file name instead of failing silently. **Such files cannot be read through QuarkFS for now.** If the login has expired, log out under "Components & account" and scan the QR code again.
+To read large files, the engine identifies itself to Quark as the Quark desktop client (`user_agent` in the runtime configuration). This uses your own login and reads only your own files; this does not involve or unlock any paid membership features. Quark may change or restrict this at any time, and if you do not want this behaviour you should not use QuarkFS for large files.
+
+If Quark still refuses a large file (code 23018, "download file size limit"), QuarkFS shows this with the file name in the connection area, the menu bar and the activity log instead of failing silently. If the login has expired, log out under "Components & account" and scan the QR code again.
 
 ### Mount failures
 
@@ -106,6 +136,7 @@ Both the mount and the WebDAV server are read-only and refuse writes to the driv
 - The cache cleaner refuses symbolic links at the root or in intermediate folders, so it cannot delete outside its own directory.
 - If the mounted disk is in use and cannot be unmounted, the app cancels quitting and keeps the connection.
 - During QR login the cookies are held in a separate in-memory store. They are saved to the Keychain only after the drive session has been verified.
+- Update checks contact only `api.github.com` for the public release information of `007xf/QuarkFS`. When "Automatic update check" (自动检查更新) is on (enabled by default), it checks at most once every 24 hours after startup and while running; an automatic check that fails because the Mac is offline is tried again an hour later, at most three times, then waits 24 hours (manual checks, successful checks, rate-limited responses, and other failures restart the 24-hour interval). You can also check on request via "Check for updates" (检查更新 / 检查更新…). Requests use an ephemeral session with cookies, cache, stored credentials and redirects disabled, and send nothing except the running app version in `User-Agent` — no account data, file names or identifiers (as with any web request, GitHub sees the request's IP address). QuarkFS never downloads or installs updates automatically; clicking "View release page" (查看发行页面) opens only the validated `https://github.com/007xf/QuarkFS` page in your default browser. Turn off automatic checks at any time in the "Version & updates" (版本与更新) card.
 - Engine logs record NOTICE level and above. Each log rotates at 10 MB and keeps one backup. Logs can contain network errors and file paths, so check and redact them before attaching them to an issue.
 
 The first time the Keychain asks, enter your Mac login password and choose "Always Allow". The app reuses the converted credential for the rest of the run, so mounting, unmounting and remounting do not read the Keychain again. After an upgrade, macOS may treat an ad-hoc signed build as a new app and ask once more.
@@ -150,7 +181,7 @@ Changes are listed in the [changelog](05%20更新记录.md) (Chinese).
 
 ## Known limitations
 
-- Large files that Quark refuses with code 23018 cannot be read (see [Large files](#large-files)).
+- Quark may refuse a large file with code 23018 or restrict desktop-client access at any time; when that happens, QuarkFS reports the refusal with the file name (see [Large files](#large-files)).
 - The Quark Drive backend depends on Quark's web interface and a full browser Cookie. Changes to the interface, to risk control or to account policy can force a new login or make the drive unavailable for a while.
 - The upstream Quark backend is still a draft PR, which is why the version is pinned. Re-read the upstream license and changes before updating it.
 - Approval of the macFUSE system extension is controlled by macOS. QuarkFS cannot approve it for you, and it is not a substitute for Apple Developer ID signing and notarization.

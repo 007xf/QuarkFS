@@ -66,6 +66,9 @@ elif args[:2] == ["cmount", "quark:"] and os.environ.get("QUARKFS_TEST_REAL_ENGI
 elif "webdav" in args:
     host, port = args[args.index("--addr") + 1].split(":")
     support = Path(args[args.index("--config") + 1]).parent.parent
+    start_counter = support / "webdav-start-count"
+    start_count = int(start_counter.read_text()) + 1 if start_counter.exists() else 1
+    start_counter.write_text(str(start_count))
     # Hold a file in the cache, as the real engine does while serving, and
     # record on SIGTERM whether the cache was still intact when we were stopped.
     cache_file = Path(args[args.index("--cache-dir") + 1]) / "fixture-open-file"
