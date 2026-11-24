@@ -10,7 +10,8 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 15
+    # 1.2.0 grew the code and tests by about 70%; 15 minutes is no longer enough.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,19 +27,24 @@ jobs:
           zsh -n "Tests/QuarkFSCoreTests/ScriptChecks.zsh"
 
       - name: Run core smoke test
+        timeout-minutes: 15
         run: swift run --disable-sandbox --build-system native --scratch-path .build/ci-smoke QuarkFSSmokeTests
 
       - name: Check application lifecycle without a cloud account
+        timeout-minutes: 15
         run: |
           "Scripts/04 检查应用行为.command"
 
       - name: Build Apple Silicon app
+        timeout-minutes: 15
         run: swift build --disable-sandbox --build-system native --scratch-path .build/ci-arm64 -c release --triple arm64-apple-macosx14.0
 
       - name: Check single-instance contention and crash recovery
+        timeout-minutes: 10
         run: '"Scripts/06 检查单实例.command"'
 
       - name: Check build, release and install scripts without installing
+        timeout-minutes: 10
         run: zsh "Tests/QuarkFSCoreTests/ScriptChecks.zsh"
 
       - name: Verify Apple Silicon app architecture
